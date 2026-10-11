@@ -18,15 +18,20 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta
 from typing import Any, AsyncIterator, Iterable, Mapping, Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import asyncpg
 
 from .models import (
     CLAIMABLE_STATES,
     DEFAULT_LEASE_SECONDS,
+    OPERATION_FAILED,
+    OPERATION_VERIFIED,
     PENDING_RECOVERY_STATES,
+    RECOVERY_CLAIMABLE_STATES,
+    SERVICE_ID,
     Approval,
+    ApprovalStale,
     Event,
     EventKind,
     Evidence,
@@ -39,10 +44,18 @@ from .models import (
     Operation,
     PayloadTooLarge,
     Proposal,
+    ProposalNotFound,
+    Reservation,
+    ReservationConflict,
     ensure_utc,
     legal_predecessors,
     utcnow,
     validate_payload,
+)
+
+_OPERATION_COLS = (
+    "id, incident_id, approval_id, status, target_revision, result, created_at, "
+    "updated_at, service_id, expected_generation, attempts, last_error, verified_at"
 )
 
 _COLS = (
@@ -503,26 +516,588 @@ class IncidentRepository:
         incident_id: UUID,
         approval_id: Optional[UUID],
         target_revision: str,
+        service_id: Optional[str] = SERVICE_ID,
+        expected_generation: Optional[int] = None,
     ) -> Operation:
         row = await self.pool.fetchrow(
-            "INSERT INTO recovery_operations (id, incident_id, approval_id, target_revision) "
-            "VALUES ($1, $2, $3, $4) "
-            "RETURNING id, incident_id, approval_id, status, target_revision, result, "
-            "created_at, updated_at",
+            f"INSERT INTO recovery_operations (id, incident_id, approval_id, target_revision, "
+            f"service_id, expected_generation) "
+            f"VALUES ($1, $2, $3, $4, $5, $6) RETURNING {_OPERATION_COLS}",
             operation_id,
             incident_id,
             approval_id,
             target_revision,
+            service_id,
+            expected_generation,
         )
         return _row_to_operation(row)
 
     async def get_operation(self, operation_id: UUID) -> Optional[Operation]:
         row = await self.pool.fetchrow(
-            "SELECT id, incident_id, approval_id, status, target_revision, result, "
-            "created_at, updated_at FROM recovery_operations WHERE id = $1",
+            f"SELECT {_OPERATION_COLS} FROM recovery_operations WHERE id = $1",
             operation_id,
         )
         return _row_to_operation(row) if row else None
+
+    async def get_operation_for_incident(self, incident_id: UUID) -> Optional[Operation]:
+        row = await self.pool.fetchrow(
+            f"SELECT {_OPERATION_COLS} FROM recovery_operations "
+            f"WHERE incident_id = $1 ORDER BY created_at DESC LIMIT 1",
+            incident_id,
+        )
+        return _row_to_operation(row) if row else None
+
+    async def set_operation_status(
+        self,
+        operation_id: UUID,
+        status: str,
+        *,
+        result: Optional[Mapping[str, Any]] = None,
+        last_error: Optional[str] = None,
+        mark_verified: bool = False,
+        bump_attempts: bool = False,
+    ) -> Operation:
+        """Conditionally update operation state; returns the current row.
+
+        Terminal operations are never rewritten by a late status change.
+        """
+        validate_payload(result or {})
+        row = await self.pool.fetchrow(
+            f"UPDATE recovery_operations SET status = $2, "
+            f"result = COALESCE($3::jsonb, result), "
+            f"last_error = COALESCE($4, last_error), "
+            f"attempts = attempts + CASE WHEN $5 THEN 1 ELSE 0 END, "
+            f"verified_at = CASE WHEN $6 THEN now() ELSE verified_at END, "
+            f"updated_at = now() "
+            f"WHERE id = $1 AND status NOT IN ('verified','failed') "
+            f"RETURNING {_OPERATION_COLS}",
+            operation_id,
+            status,
+            dict(result) if result is not None else None,
+            last_error,
+            bump_attempts,
+            mark_verified,
+        )
+        if row is None:
+            existing = await self.get_operation(operation_id)
+            if existing is None:
+                raise NotFound(f"operation {operation_id} not found")
+            return existing
+        return _row_to_operation(row)
+
+    # --- proposals / approvals -------------------------------------------------
+
+    async def get_proposal_by_digest(
+        self, incident_id: UUID, digest: str
+    ) -> Optional[Proposal]:
+        row = await self.pool.fetchrow(
+            "SELECT id, incident_id, service_id, expected_generation, current_revision, "
+            "target_revision, evidence_ids, digest, created_at FROM proposals "
+            "WHERE incident_id = $1 AND digest = $2",
+            incident_id,
+            digest,
+        )
+        return _row_to_proposal(row) if row else None
+
+    async def get_proposal_for_incident(self, incident_id: UUID) -> Optional[Proposal]:
+        row = await self.pool.fetchrow(
+            "SELECT id, incident_id, service_id, expected_generation, current_revision, "
+            "target_revision, evidence_ids, digest, created_at FROM proposals "
+            "WHERE incident_id = $1 ORDER BY created_at DESC LIMIT 1",
+            incident_id,
+        )
+        return _row_to_proposal(row) if row else None
+
+    async def get_approval_for_incident(self, incident_id: UUID) -> Optional[Approval]:
+        row = await self.pool.fetchrow(
+            "SELECT id, incident_id, proposal_id, proposal_digest, service_id, "
+            "expected_revision, target_revision, actor, status, created_at, expires_at, "
+            "consumed_by_operation FROM approvals WHERE incident_id = $1 "
+            "ORDER BY created_at DESC LIMIT 1",
+            incident_id,
+        )
+        return _row_to_approval(row) if row else None
+
+    async def approve_incident(
+        self,
+        incident_id: UUID,
+        proposal_digest: str,
+        actor: str,
+        *,
+        ttl_seconds: int = 300,
+        now: Optional[datetime] = None,
+    ) -> tuple[Approval, Operation, bool]:
+        """Authorize the exact proposal digest.
+
+        The proposal digest, fixed service, current revision/generation, known-good
+        predecessor, actor, and a five-minute UTC expiry are all bound atomically.
+        Duplicate submissions return the one persisted approval/operation; a
+        competing reservation (fault or recovery) fails closed.
+        """
+        instant = ensure_utc(now or utcnow())
+        expires_at = instant + timedelta(seconds=ttl_seconds)
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                incident_row = await conn.fetchrow(
+                    f"SELECT {_COLS} FROM incidents WHERE id = $1 FOR UPDATE", incident_id
+                )
+                if incident_row is None:
+                    raise NotFound(f"incident {incident_id} not found")
+                incident = _row_to_incident(incident_row)
+
+                proposal = await conn.fetchrow(
+                    "SELECT id, incident_id, service_id, expected_generation, "
+                    "current_revision, target_revision, evidence_ids, digest, created_at "
+                    "FROM proposals WHERE incident_id = $1 AND digest = $2",
+                    incident_id,
+                    proposal_digest,
+                )
+                if proposal is None:
+                    raise ProposalNotFound("proposal digest not found for incident")
+
+                # Idempotent duplicate: return the existing approval and operation.
+                existing = await conn.fetchrow(
+                    "SELECT id, incident_id, proposal_id, proposal_digest, service_id, "
+                    "expected_revision, target_revision, actor, status, created_at, "
+                    "expires_at, consumed_by_operation FROM approvals "
+                    "WHERE incident_id = $1 AND proposal_id = $2",
+                    incident_id,
+                    proposal["id"],
+                )
+                if existing is not None:
+                    operation = await self._operation_for_approval(conn, existing["id"])
+                    return _row_to_approval(existing), operation, False
+
+                if incident.state is not IncidentState.AWAITING_APPROVAL:
+                    raise IllegalStateTransition(
+                        f"cannot approve incident in state {incident.state.value}"
+                    )
+
+                state_row = await conn.fetchrow(
+                    "SELECT service_id, revision, generation, activated_at, predecessor "
+                    "FROM deployment_state WHERE service_id = $1 FOR UPDATE",
+                    SERVICE_ID,
+                )
+                if state_row is None:
+                    raise NotFound("deployment_state is not initialised")
+
+                target = proposal["target_revision"]
+                if proposal["service_id"] != SERVICE_ID:
+                    raise ApprovalStale("proposal service is not the fixed demo service")
+                if (
+                    proposal["expected_generation"] != state_row["generation"]
+                    or proposal["current_revision"] != state_row["revision"]
+                ):
+                    raise ApprovalStale("proposal revision/generation is stale")
+                if state_row["predecessor"] is None or target != state_row["predecessor"]:
+                    raise ApprovalStale("target revision is not the recorded predecessor")
+
+                approval_row = await conn.fetchrow(
+                    "INSERT INTO approvals (incident_id, proposal_id, proposal_digest, "
+                    "service_id, expected_revision, target_revision, actor, expires_at) "
+                    "VALUES ($1, $2, $3, $4, $5, $6, $7, $8) "
+                    "RETURNING id, incident_id, proposal_id, proposal_digest, service_id, "
+                    "expected_revision, target_revision, actor, status, created_at, "
+                    "expires_at, consumed_by_operation",
+                    incident_id,
+                    proposal["id"],
+                    proposal_digest,
+                    SERVICE_ID,
+                    state_row["revision"],
+                    target,
+                    actor,
+                    expires_at,
+                )
+
+                operation_id = uuid4()
+                operation_row = await conn.fetchrow(
+                    f"INSERT INTO recovery_operations (id, incident_id, approval_id, "
+                    f"target_revision, service_id, expected_generation) "
+                    f"VALUES ($1, $2, $3, $4, $5, $6) RETURNING {_OPERATION_COLS}",
+                    operation_id,
+                    incident_id,
+                    approval_row["id"],
+                    target,
+                    SERVICE_ID,
+                    state_row["generation"],
+                )
+
+                try:
+                    await conn.execute(
+                        "INSERT INTO deployment_reservations (operation_id, service_id, scope, "
+                        "expected_generation, target_revision) VALUES ($1, $2, 'recovery', $3, $4)",
+                        operation_id,
+                        SERVICE_ID,
+                        state_row["generation"],
+                        target,
+                    )
+                except asyncpg.UniqueViolationError as exc:
+                    raise ReservationConflict(
+                        "deployment is reserved by a competing operation"
+                    ) from exc
+
+                transitioned = await conn.fetchrow(
+                    "UPDATE incidents SET state = $2, updated_at = now(), "
+                    "version = version + 1 WHERE id = $1 AND state = $3 RETURNING id",
+                    incident_id,
+                    IncidentState.RECOVERING.value,
+                    IncidentState.AWAITING_APPROVAL.value,
+                )
+                if transitioned is None:  # pragma: no cover - guarded by row lock
+                    raise IllegalStateTransition("incident left awaiting_approval")
+
+                await conn.execute(
+                    "INSERT INTO incident_events (incident_id, kind, payload) "
+                    "VALUES ($1, $2, $3::jsonb)",
+                    incident_id,
+                    EventKind.APPROVED.value,
+                    {
+                        "approval_id": str(approval_row["id"]),
+                        "operation_id": str(operation_id),
+                        "digest": proposal_digest,
+                        "actor": actor,
+                        "expires_at": ensure_utc(expires_at).isoformat(),
+                    },
+                )
+                await conn.execute(
+                    "INSERT INTO incident_events (incident_id, kind, payload) "
+                    "VALUES ($1, $2, $3::jsonb)",
+                    incident_id,
+                    EventKind.RECOVERY_STARTED.value,
+                    {
+                        "operation_id": str(operation_id),
+                        "target_revision": target,
+                    },
+                )
+        return _row_to_approval(approval_row), _row_to_operation(operation_row), True
+
+    async def consume_approval(self, approval_id: UUID, operation_id: UUID) -> bool:
+        """Mark an approval consumed by exactly one operation (idempotent)."""
+        row = await self.pool.fetchrow(
+            "UPDATE approvals SET status = 'consumed', consumed_by_operation = $2 "
+            "WHERE id = $1 AND (consumed_by_operation IS NULL OR consumed_by_operation = $2) "
+            "RETURNING id",
+            approval_id,
+            operation_id,
+        )
+        return row is not None
+
+    async def record_execution(
+        self, operation_id: UUID, result: Mapping[str, Any]
+    ) -> Operation:
+        """Persist a successful execution and its distinct event atomically."""
+        validate_payload(result)
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    f"UPDATE recovery_operations SET status = $2, result = $3::jsonb, "
+                    f"updated_at = now() WHERE id = $1 "
+                    f"AND status NOT IN ('verified','failed') RETURNING {_OPERATION_COLS}",
+                    operation_id,
+                    "executed",
+                    dict(result),
+                )
+                if row is None:
+                    existing = await self.get_operation(operation_id)
+                    if existing is None:
+                        raise NotFound(f"operation {operation_id} not found")
+                    return existing
+                await conn.execute(
+                    "INSERT INTO incident_events (incident_id, kind, payload) "
+                    "VALUES ($1, $2, $3::jsonb)",
+                    row["incident_id"],
+                    EventKind.RECOVERY_EXECUTED.value,
+                    {"operation_id": str(operation_id), **dict(result)},
+                )
+        return _row_to_operation(row)
+
+    async def _operation_for_approval(
+        self, conn: asyncpg.Connection, approval_id: UUID
+    ) -> Operation:
+        row = await conn.fetchrow(
+            f"SELECT {_OPERATION_COLS} FROM recovery_operations "
+            f"WHERE approval_id = $1 ORDER BY created_at DESC LIMIT 1",
+            approval_id,
+        )
+        if row is None:  # pragma: no cover - approval always creates an operation
+            raise NotFound("operation for approval not found")
+        return _row_to_operation(row)
+
+    async def reject_incident(
+        self,
+        incident_id: UUID,
+        actor: str,
+        *,
+        reason: Optional[str] = None,
+        proposal_digest: Optional[str] = None,
+        now: Optional[datetime] = None,
+    ) -> Incident:
+        instant = ensure_utc(now or utcnow())
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    f"UPDATE incidents SET state = $2, updated_at = now(), "
+                    f"version = version + 1 "
+                    f"WHERE id = $1 AND state = $3 RETURNING {_COLS_Q}",
+                    incident_id,
+                    IncidentState.REJECTED.value,
+                    IncidentState.AWAITING_APPROVAL.value,
+                )
+                if row is None:
+                    current = await conn.fetchrow(
+                        "SELECT state FROM incidents WHERE id = $1", incident_id
+                    )
+                    if current is None:
+                        raise NotFound(f"incident {incident_id} not found")
+                    raise IllegalStateTransition(
+                        f"cannot reject incident in state {current['state']}"
+                    )
+                await conn.execute(
+                    "INSERT INTO incident_events (incident_id, kind, payload) "
+                    "VALUES ($1, $2, $3::jsonb)",
+                    incident_id,
+                    EventKind.REJECTED.value,
+                    {
+                        "actor": actor,
+                        "reason": reason,
+                        "digest": proposal_digest,
+                        "at": instant.isoformat(),
+                    },
+                )
+        return _row_to_incident(row)
+
+    # --- authoritative deployment reservations --------------------------------
+
+    async def reserve(
+        self,
+        operation_id: UUID,
+        *,
+        scope: str,
+        expected_generation: int,
+        target_revision: str,
+        service_id: str = SERVICE_ID,
+    ) -> Reservation:
+        """Claim the deployment mutation token; fail closed if already held."""
+        try:
+            row = await self.pool.fetchrow(
+                "INSERT INTO deployment_reservations (operation_id, service_id, scope, "
+                "expected_generation, target_revision) VALUES ($1, $2, $3, $4, $5) "
+                "RETURNING operation_id, service_id, scope, status, expected_generation, "
+                "target_revision, created_at, released_at",
+                operation_id,
+                service_id,
+                scope,
+                expected_generation,
+                target_revision,
+            )
+        except asyncpg.UniqueViolationError as exc:
+            raise ReservationConflict("deployment is already reserved") from exc
+        return _row_to_reservation(row)
+
+    async def release_reservation(self, operation_id: UUID) -> None:
+        await self.pool.execute(
+            "UPDATE deployment_reservations SET status = 'released', released_at = now() "
+            "WHERE operation_id = $1 AND status = 'active'",
+            operation_id,
+        )
+
+    async def get_reservation(self, operation_id: UUID) -> Optional[Reservation]:
+        row = await self.pool.fetchrow(
+            "SELECT operation_id, service_id, scope, status, expected_generation, "
+            "target_revision, created_at, released_at FROM deployment_reservations "
+            "WHERE operation_id = $1",
+            operation_id,
+        )
+        return _row_to_reservation(row) if row else None
+
+    async def active_reservation(self, service_id: str = SERVICE_ID) -> Optional[Reservation]:
+        row = await self.pool.fetchrow(
+            "SELECT operation_id, service_id, scope, status, expected_generation, "
+            "target_revision, created_at, released_at FROM deployment_reservations "
+            "WHERE service_id = $1 AND status = 'active' LIMIT 1",
+            service_id,
+        )
+        return _row_to_reservation(row) if row else None
+
+    # --- durable recovery worker ----------------------------------------------
+
+    async def claim_next_recovery(
+        self,
+        worker_id: str,
+        *,
+        lease_seconds: int = DEFAULT_LEASE_SECONDS,
+        now: Optional[datetime] = None,
+    ) -> Optional[Incident]:
+        instant = ensure_utc(now or utcnow())
+        expiry = instant + timedelta(seconds=lease_seconds)
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    f"WITH candidate AS ("
+                    f"  SELECT id FROM incidents "
+                    f"  WHERE state = ANY($3::text[]) "
+                    f"    AND (lease_expires_at IS NULL OR lease_expires_at <= $4) "
+                    f"  ORDER BY detected_at "
+                    f"  FOR UPDATE SKIP LOCKED LIMIT 1"
+                    f") "
+                    f"UPDATE incidents SET lease_owner = $1, lease_expires_at = $2, "
+                    f"updated_at = now() FROM candidate "
+                    f"WHERE incidents.id = candidate.id RETURNING {_COLS_Q}",
+                    worker_id,
+                    expiry,
+                    [state.value for state in RECOVERY_CLAIMABLE_STATES],
+                    instant,
+                )
+        return _row_to_incident(row) if row else None
+
+    async def verify_revision(self, expected_revision: str, *, service_id: str = SERVICE_ID) -> bool:
+        """Read the authoritative active revision from PostgreSQL."""
+        revision = await self.pool.fetchval(
+            "SELECT revision FROM deployment_state WHERE service_id = $1", service_id
+        )
+        return revision == expected_revision
+
+    async def finalize_verification(
+        self,
+        incident_id: UUID,
+        worker_id: str,
+        operation_id: UUID,
+        *,
+        success: bool,
+        verification: Mapping[str, Any],
+        now: Optional[datetime] = None,
+    ) -> Incident:
+        """Atomically persist the verification outcome and release the reservation.
+
+        The incumbent worker's lease must still be valid; a stale worker can never
+        resolve the incident.  A consumed approval/operation is terminal.
+        """
+        instant = ensure_utc(now or utcnow())
+        validate_payload(verification)
+        target_state = IncidentState.RESOLVED if success else IncidentState.RECOVERY_FAILED
+        predecessors = [state.value for state in legal_predecessors(target_state)]
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    f"UPDATE incidents SET state = $3, lease_expires_at = NULL, "
+                    f"updated_at = now(), version = version + 1 "
+                    f"WHERE id = $1 AND lease_owner = $2 AND lease_expires_at > $4 "
+                    f"AND state = ANY($5::text[]) RETURNING {_COLS_Q}",
+                    incident_id,
+                    worker_id,
+                    target_state.value,
+                    instant,
+                    predecessors,
+                )
+                if row is None:
+                    current = await conn.fetchrow(
+                        f"SELECT {_COLS} FROM incidents WHERE id = $1", incident_id
+                    )
+                    if current is None:
+                        raise NotFound(f"incident {incident_id} not found")
+                    ok = (
+                        current["lease_owner"] == worker_id
+                        and current["lease_expires_at"] is not None
+                        and ensure_utc(current["lease_expires_at"]) > instant
+                    )
+                    if not ok:
+                        raise LeaseLost(f"lease for {incident_id} not held by {worker_id}")
+                    raise IllegalStateTransition(
+                        f"cannot move {current['state']} -> {target_state.value}"
+                    )
+
+                await conn.execute(
+                    "UPDATE recovery_operations SET status = $2, result = $3::jsonb, "
+                    "verified_at = CASE WHEN $4 THEN now() ELSE verified_at END, "
+                    "updated_at = now() WHERE id = $1",
+                    operation_id,
+                    OPERATION_VERIFIED if success else OPERATION_FAILED,
+                    dict(verification),
+                    success,
+                )
+                await conn.execute(
+                    "UPDATE deployment_reservations SET status = 'released', "
+                    "released_at = now() WHERE operation_id = $1 AND status = 'active'",
+                    operation_id,
+                )
+                await conn.execute(
+                    "INSERT INTO incident_events (incident_id, kind, payload) "
+                    "VALUES ($1, $2, $3::jsonb)",
+                    incident_id,
+                    (
+                        EventKind.RECOVERY_VERIFIED.value
+                        if success
+                        else EventKind.RECOVERY_FAILED.value
+                    ),
+                    dict(verification),
+                )
+        return _row_to_incident(row)
+
+    async def fail_recovery(
+        self,
+        incident_id: UUID,
+        worker_id: str,
+        operation_id: UUID,
+        *,
+        error: str,
+        result: Optional[Mapping[str, Any]] = None,
+        now: Optional[datetime] = None,
+    ) -> Incident:
+        """Persist a failed recovery operation and move the incident to recovery_failed."""
+        instant = ensure_utc(now or utcnow())
+        payload = {"error": error, **dict(result or {})}
+        validate_payload(payload)
+        predecessors = [state.value for state in legal_predecessors(IncidentState.RECOVERY_FAILED)]
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    f"UPDATE incidents SET state = $3, lease_expires_at = NULL, "
+                    f"updated_at = now(), version = version + 1 "
+                    f"WHERE id = $1 AND lease_owner = $2 AND lease_expires_at > $4 "
+                    f"AND state = ANY($5::text[]) RETURNING {_COLS_Q}",
+                    incident_id,
+                    worker_id,
+                    IncidentState.RECOVERY_FAILED.value,
+                    instant,
+                    predecessors,
+                )
+                if row is None:
+                    current = await conn.fetchrow(
+                        f"SELECT {_COLS} FROM incidents WHERE id = $1", incident_id
+                    )
+                    if current is None:
+                        raise NotFound(f"incident {incident_id} not found")
+                    ok = (
+                        current["lease_owner"] == worker_id
+                        and current["lease_expires_at"] is not None
+                        and ensure_utc(current["lease_expires_at"]) > instant
+                    )
+                    if not ok:
+                        raise LeaseLost(f"lease for {incident_id} not held by {worker_id}")
+                    raise IllegalStateTransition(
+                        f"cannot move {current['state']} -> recovery_failed"
+                    )
+                await conn.execute(
+                    "UPDATE recovery_operations SET status = $2, last_error = $3, "
+                    "result = COALESCE($4::jsonb, result), updated_at = now() WHERE id = $1",
+                    operation_id,
+                    OPERATION_FAILED,
+                    error,
+                    dict(result) if result is not None else None,
+                )
+                await conn.execute(
+                    "UPDATE deployment_reservations SET status = 'released', "
+                    "released_at = now() WHERE operation_id = $1 AND status = 'active'",
+                    operation_id,
+                )
+                await conn.execute(
+                    "INSERT INTO incident_events (incident_id, kind, payload) "
+                    "VALUES ($1, $2, $3::jsonb)",
+                    incident_id,
+                    EventKind.RECOVERY_FAILED.value,
+                    payload,
+                )
+        return _row_to_incident(row)
 
 
 def _row_to_proposal(row: asyncpg.Record) -> Proposal:
@@ -566,4 +1141,22 @@ def _row_to_operation(row: asyncpg.Record) -> Operation:
         result=row["result"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        service_id=row["service_id"],
+        expected_generation=row["expected_generation"],
+        attempts=row["attempts"],
+        last_error=row["last_error"],
+        verified_at=row["verified_at"],
+    )
+
+
+def _row_to_reservation(row: asyncpg.Record) -> Reservation:
+    return Reservation(
+        operation_id=row["operation_id"],
+        service_id=row["service_id"],
+        scope=row["scope"],
+        status=row["status"],
+        expected_generation=row["expected_generation"],
+        target_revision=row["target_revision"],
+        created_at=row["created_at"],
+        released_at=row["released_at"],
     )

@@ -120,6 +120,51 @@ services:
         condition: service_healthy
     healthcheck: *healthz-check
 
+  # Restricted internal executor. It accepts only a persisted operation id over
+  # an authenticated internal channel and drives the fixed desired-state switch.
+  # It exposes NO host port and deliberately receives NO Docker socket: gateway
+  # revision switching needs no Docker power (restart remains deferred).
+  executor:
+    <<: *app
+    command: ["python", "-m", "incident_recovery.executor"]
+    environment:
+      PORT: "8000"
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN}
+      GATEWAY_INTERNAL_URL: http://gateway-control:8000
+    networks:
+      - internal_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      gateway-control:
+        condition: service_healthy
+    healthcheck: *healthz-check
+
+  # Durable recovery worker: claims leased incidents, executes the persisted
+  # operation through the executor, then verifies sustained functional recovery.
+  worker:
+    <<: *app
+    command: ["python", "-m", "incident_recovery.worker"]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN}
+      EXECUTOR_URL: http://executor:8000
+      GATEWAY_URL: http://gateway:8000
+      WORKER_ID: worker-1
+      WORKER_POLL_INTERVAL: "1.0"
+      RECOVERY_LEASE_SECONDS: "120"
+    networks:
+      - internal_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      executor:
+        condition: service_healthy
+      gateway:
+        condition: service_healthy
+    restart: unless-stopped
+
 networks:
   demo_net:
     driver: bridge

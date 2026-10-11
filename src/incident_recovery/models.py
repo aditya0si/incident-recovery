@@ -54,6 +54,12 @@ PENDING_RECOVERY_STATES: frozenset[IncidentState] = frozenset(
     {IncidentState.RECOVERING, IncidentState.VERIFYING}
 )
 
+# States a durable recovery worker may claim.  ``verifying`` is claimable so an
+# interrupted verification resumes from persisted state after a crash.
+RECOVERY_CLAIMABLE_STATES: frozenset[IncidentState] = frozenset(
+    {IncidentState.RECOVERING, IncidentState.VERIFYING}
+)
+
 # Explicit, reviewable state machine.  A transition is refused unless the
 # persisted current state is a legal predecessor of the requested target.
 LEGAL_TRANSITIONS: dict[IncidentState, frozenset[IncidentState]] = {
@@ -98,6 +104,7 @@ class EventKind(str, Enum):
     APPROVED = "approved"
     REJECTED = "rejected"
     RECOVERY_STARTED = "recovery_started"
+    RECOVERY_EXECUTED = "recovery_executed"
     RECOVERY_VERIFIED = "recovery_verified"
     RECOVERY_FAILED = "recovery_failed"
     ESCALATED = "escalated"
@@ -133,6 +140,50 @@ class LeaseLost(WorkflowError):
 
 class PayloadTooLarge(WorkflowError):
     pass
+
+
+class ProposalNotFound(WorkflowError):
+    pass
+
+
+class ApprovalError(WorkflowError):
+    """A proposed recovery may not be authorized; the request fails closed."""
+
+
+class ApprovalExpired(ApprovalError):
+    pass
+
+
+class ApprovalStale(ApprovalError):
+    pass
+
+
+class ApprovalConsumed(ApprovalError):
+    pass
+
+
+class ReservationConflict(WorkflowError):
+    """Another reservation already owns the deployment for this service."""
+
+
+class SwitchUnreachable(RuntimeError):
+    """The internal switch could not be reached or returned an unusable body."""
+
+
+WORKFLOW_STATE = IncidentState
+
+# Closed set of persisted recovery-operation statuses.
+OPERATION_PENDING = "pending"
+OPERATION_EXECUTING = "executing"
+OPERATION_EXECUTED = "executed"
+OPERATION_VERIFYING = "verifying"
+OPERATION_VERIFIED = "verified"
+OPERATION_FAILED = "failed"
+
+OPERATION_TERMINAL: frozenset[str] = frozenset({OPERATION_VERIFIED, OPERATION_FAILED})
+
+RESERVATION_SCOPE_FAULT = "fault"
+RESERVATION_SCOPE_RECOVERY = "recovery"
 
 
 def utcnow() -> datetime:
@@ -232,6 +283,23 @@ class Operation:
     result: Optional[dict[str, Any]]
     created_at: datetime
     updated_at: datetime
+    service_id: Optional[str] = None
+    expected_generation: Optional[int] = None
+    attempts: int = 0
+    last_error: Optional[str] = None
+    verified_at: Optional[datetime] = None
+
+
+@dataclass(frozen=True)
+class Reservation:
+    operation_id: UUID
+    service_id: str
+    scope: str
+    status: str
+    expected_generation: int
+    target_revision: str
+    created_at: datetime
+    released_at: Optional[datetime]
 
 
 DEFAULT_LEASE_SECONDS = 30

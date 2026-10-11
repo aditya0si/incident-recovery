@@ -131,9 +131,65 @@ CREATE INDEX IF NOT EXISTS recovery_operations_incident_idx
     ON recovery_operations (incident_id, status);
 """
 
+RECOVERY_SCHEMA_SQL = """
+-- Migration 3: approval-gated recovery.
+--
+-- ``deployment_reservations`` is the authoritative deployment-mutation token.
+-- The partial unique index guarantees at most one *active* reservation per
+-- service, so a fault injection and a recovery can never both own the
+-- deployment and an unauthorized competing change can never win a race by
+-- slipping between a check and the switch.  The gateway switch transaction
+-- (which locks ``deployment_state``) validates this token before mutating.
+
+CREATE TABLE IF NOT EXISTS deployment_reservations (
+    operation_id        UUID PRIMARY KEY,
+    service_id          TEXT NOT NULL,
+    scope               TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'active',
+    expected_generation INTEGER NOT NULL,
+    target_revision     TEXT NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    released_at         TIMESTAMPTZ,
+    CONSTRAINT deployment_reservations_scope_valid CHECK (scope IN ('fault','recovery')),
+    CONSTRAINT deployment_reservations_status_valid CHECK (status IN ('active','released'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS deployment_reservations_active_idx
+    ON deployment_reservations (service_id) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS deployment_reservations_operation_idx
+    ON deployment_reservations (operation_id);
+
+-- Concurrent duplicate approvals for one proposal collapse to a single record,
+-- so duplicated operator submissions cannot create two logical recoveries.
+CREATE UNIQUE INDEX IF NOT EXISTS approvals_incident_proposal_idx
+    ON approvals (incident_id, proposal_id);
+
+-- Operation lifecycle and reconciliation detail.
+ALTER TABLE recovery_operations
+    ADD COLUMN IF NOT EXISTS service_id TEXT;
+ALTER TABLE recovery_operations
+    ADD COLUMN IF NOT EXISTS expected_generation INTEGER;
+ALTER TABLE recovery_operations
+    ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE recovery_operations
+    ADD COLUMN IF NOT EXISTS last_error TEXT;
+ALTER TABLE recovery_operations
+    ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ;
+ALTER TABLE recovery_operations DROP CONSTRAINT IF EXISTS recovery_operations_status_valid;
+ALTER TABLE recovery_operations ADD CONSTRAINT recovery_operations_status_valid
+    CHECK (status IN ('pending','executing','executed','verifying','verified','failed'));
+
+-- Add the distinct recovery_executed event kind.
+ALTER TABLE incident_events DROP CONSTRAINT IF EXISTS incident_events_kind_valid;
+ALTER TABLE incident_events ADD CONSTRAINT incident_events_kind_valid CHECK (kind IN (
+    'detected','state_changed','evidence_recorded','proposal_created',
+    'approval_requested','approved','rejected','recovery_started',
+    'recovery_executed','recovery_verified','recovery_failed','escalated','fault_injected'));
+"""
+
 MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, DEPLOYMENT_SCHEMA_SQL),
     (2, INCIDENT_SCHEMA_SQL),
+    (3, RECOVERY_SCHEMA_SQL),
 )
 
 _ADVISORY_LOCK_KEY = 7762002

@@ -14,7 +14,6 @@ from __future__ import annotations
 import os
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Optional
 
 import asyncpg
@@ -23,7 +22,8 @@ import pytest_asyncio
 
 from incident_recovery import db as db_module
 from incident_recovery.api import create_app
-from incident_recovery.contracts import DeploymentSnapshot, SwitchDecision
+from incident_recovery.contracts import SwitchDecision, SwitchRequest
+from incident_recovery.gateway import DeploymentStore
 from incident_recovery.repository import IncidentRepository
 
 OPERATOR_TOKEN = "test-operator-token-9f3a4c"
@@ -86,31 +86,27 @@ async def repo(test_db: TestDB) -> IncidentRepository:
     return IncidentRepository(test_db.pool)
 
 
-class FakeStore:
-    """Read-only deployment snapshot reader for in-process API tests."""
-
-    def __init__(self, revision: str = "healthy-v1", generation: int = 1) -> None:
-        self._snapshot = DeploymentSnapshot(
-            service_id="demo-api",
-            revision=revision,
-            generation=generation,
-            activated_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
-            predecessor=None,
-        )
-
-    async def get_snapshot(self) -> DeploymentSnapshot:
-        return self._snapshot
+@pytest_asyncio.fixture
+async def store(test_db: TestDB) -> DeploymentStore:
+    return DeploymentStore(test_db.pool)
 
 
-class FakeSwitchClient:
-    """Deterministic stand-in for the internal gateway switch over the network."""
+class RealSwitchClient:
+    """In-process switch client bound to the authoritative PostgreSQL store.
 
-    def __init__(self, store: FakeStore) -> None:
+    It exercises the real reservation/approval validation in the gateway switch
+    transaction instead of a fabricated decision.
+    """
+
+    def __init__(self, store: DeploymentStore) -> None:
         self._store = store
         self.calls: list[dict] = []
         self.unreachable = False
+        self.after_apply_error: Optional[BaseException] = None
 
-    async def switch(self, *, operation_id, expected_generation, target_revision):
+    async def switch(
+        self, *, operation_id, expected_generation, target_revision, scope
+    ) -> SwitchDecision:
         from incident_recovery.api import SwitchUnreachable
 
         self.calls.append(
@@ -118,35 +114,39 @@ class FakeSwitchClient:
                 "operation_id": operation_id,
                 "expected_generation": expected_generation,
                 "target_revision": target_revision,
+                "scope": scope,
             }
         )
         if self.unreachable:
             raise SwitchUnreachable("simulated ambiguity")
-        current = await self._store.get_snapshot()
-        applied = DeploymentSnapshot(
-            service_id="demo-api",
-            revision=target_revision,
-            generation=current.generation + 1,
-            activated_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
-            predecessor=current.revision,
+        decision = await self._store.switch(
+            SwitchRequest(
+                operation_id=operation_id,
+                expected_generation=expected_generation,
+                target_revision=target_revision,
+                scope=scope,
+            )
         )
-        return SwitchDecision(status="applied", snapshot=applied)
+        if self.after_apply_error is not None and decision.status == "applied":
+            # Simulate a response lost after the mutation was durably applied.
+            raise self.after_apply_error
+        return decision
 
 
 @dataclass
 class ApiApp:
     app: object
     repo: IncidentRepository
-    store: FakeStore
-    switch: FakeSwitchClient
+    store: DeploymentStore
+    switch: RealSwitchClient
 
 
 @dataclass
 class ApiHarness:
     client: httpx.AsyncClient
     repo: IncidentRepository
-    store: FakeStore
-    switch: FakeSwitchClient
+    store: DeploymentStore
+    switch: RealSwitchClient
     token: str = OPERATOR_TOKEN
     origin: str = ALLOWED_ORIGIN
 
@@ -160,8 +160,8 @@ class ApiHarness:
 @pytest_asyncio.fixture
 async def api_app(test_db: TestDB) -> ApiApp:
     repo = IncidentRepository(test_db.pool)
-    store = FakeStore()
-    switch = FakeSwitchClient(store)
+    store = DeploymentStore(test_db.pool)
+    switch = RealSwitchClient(store)
     app = create_app(
         repo,
         store=store,

@@ -37,7 +37,10 @@ class SwitchRequest(BaseModel):
     """Internal compare-and-set switch request.
 
     Extra fields are forbidden so a caller cannot smuggle a destination or any
-    other override into the switch.
+    other override into the switch.  Every switch must carry the reservation
+    scope it is acting under; the gateway switch transaction validates the
+    matching persisted reservation (and, for ``recovery``, the authoritative
+    approval/operation) before it mutates ``deployment_state``.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -45,6 +48,7 @@ class SwitchRequest(BaseModel):
     operation_id: UUID
     expected_generation: int = Field(ge=1)
     target_revision: Revision
+    scope: Literal["fault", "recovery"]
 
 
 class OperationRecord(BaseModel):
@@ -68,7 +72,7 @@ class SwitchDecision(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    status: Literal["applied", "replayed", "stale", "conflict"]
+    status: Literal["applied", "replayed", "stale", "conflict", "unauthorized"]
     snapshot: DeploymentSnapshot
 
 
@@ -135,13 +139,6 @@ class EventView(BaseModel):
     created_at: datetime
 
 
-class IncidentDetail(IncidentSummary):
-    model_config = ConfigDict(frozen=True)
-
-    evidence: List[EvidenceView] = Field(default_factory=list)
-    events: List[EventView] = Field(default_factory=list)
-
-
 class FaultRequest(BaseModel):
     """Authenticated demo fault injection. Only the fixed broken revision is valid."""
 
@@ -156,3 +153,182 @@ class FaultResult(BaseModel):
     status: str
     snapshot: DeploymentSnapshot
     reconciled: bool = False
+
+
+# --- Task 3: approval-gated rollback and recovery verification ---------------
+
+
+class ApprovalRequest(BaseModel):
+    """Operator approval. Binds an exact proposal digest; no action fields."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    proposal_digest: str = Field(min_length=1, max_length=256)
+    actor: str = Field(min_length=1, max_length=200)
+
+
+class RejectionRequest(BaseModel):
+    """Operator rejection. Never executes an action."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    actor: str = Field(min_length=1, max_length=200)
+    proposal_digest: Optional[str] = Field(default=None, max_length=256)
+    reason: Optional[str] = Field(default=None, max_length=500)
+
+
+class ProposalView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    id: UUID
+    incident_id: UUID
+    service_id: str
+    expected_generation: int
+    current_revision: str
+    target_revision: str
+    evidence_ids: List[UUID] = Field(default_factory=list)
+    digest: str
+    created_at: datetime
+
+
+class ApprovalView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    id: UUID
+    incident_id: UUID
+    proposal_id: UUID
+    proposal_digest: str
+    service_id: str
+    expected_revision: str
+    target_revision: str
+    actor: str
+    status: str
+    created_at: datetime
+    expires_at: datetime
+    consumed_by_operation: Optional[UUID] = None
+
+
+class OperationView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    id: UUID
+    incident_id: UUID
+    approval_id: Optional[UUID] = None
+    status: str
+    target_revision: str
+    result: Optional[Dict[str, Any]] = None
+    created_at: datetime
+    updated_at: datetime
+    service_id: Optional[str] = None
+    expected_generation: Optional[int] = None
+    attempts: int = 0
+    last_error: Optional[str] = None
+    verified_at: Optional[datetime] = None
+
+
+class VerificationView(BaseModel):
+    """Sustained functional-verification outcome for the future console."""
+
+    model_config = ConfigDict(frozen=True)
+
+    status: str
+    target_revision: str
+    checks: int
+    consecutive_successes: int
+    required_streak: int
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    detail: Optional[str] = None
+
+
+class ApprovalResult(BaseModel):
+    """Response for an operator approval (idempotent for duplicate submissions)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    approval: ApprovalView
+    operation: OperationView
+    created: bool
+
+
+class RejectionResult(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    incident_id: UUID
+    state: str
+    actor: str
+
+
+class ExecuteRequest(BaseModel):
+    """Internal executor request. Only a persisted operation id is accepted."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    operation_id: UUID
+
+
+class ExecuteResponse(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    operation: OperationView
+
+
+class IncidentDetail(IncidentSummary):
+    model_config = ConfigDict(frozen=True)
+
+    evidence: List[EvidenceView] = Field(default_factory=list)
+    events: List[EventView] = Field(default_factory=list)
+    proposal: Optional[ProposalView] = None
+    approval: Optional[ApprovalView] = None
+    operation: Optional[OperationView] = None
+    verification: Optional[VerificationView] = None
+
+
+def operation_view(operation) -> OperationView:
+    """Map a persisted operation dataclass to its public view."""
+    return OperationView(
+        id=operation.id,
+        incident_id=operation.incident_id,
+        approval_id=operation.approval_id,
+        status=operation.status,
+        target_revision=operation.target_revision,
+        result=operation.result,
+        created_at=operation.created_at,
+        updated_at=operation.updated_at,
+        service_id=operation.service_id,
+        expected_generation=operation.expected_generation,
+        attempts=operation.attempts,
+        last_error=operation.last_error,
+        verified_at=operation.verified_at,
+    )
+
+
+def proposal_view(proposal) -> ProposalView:
+    return ProposalView(
+        id=proposal.id,
+        incident_id=proposal.incident_id,
+        service_id=proposal.service_id,
+        expected_generation=proposal.expected_generation,
+        current_revision=proposal.current_revision,
+        target_revision=proposal.target_revision,
+        evidence_ids=list(proposal.evidence_ids),
+        digest=proposal.digest,
+        created_at=proposal.created_at,
+    )
+
+
+def approval_view(approval) -> ApprovalView:
+    return ApprovalView(
+        id=approval.id,
+        incident_id=approval.incident_id,
+        proposal_id=approval.proposal_id,
+        proposal_digest=approval.proposal_digest,
+        service_id=approval.service_id,
+        expected_revision=approval.expected_revision,
+        target_revision=approval.target_revision,
+        actor=approval.actor,
+        status=approval.status,
+        created_at=approval.created_at,
+        expires_at=approval.expires_at,
+        consumed_by_operation=approval.consumed_by_operation,
+    )

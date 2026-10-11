@@ -34,6 +34,7 @@ from .contracts import (
     SwitchDecision,
     SwitchRequest,
 )
+from .models import ensure_utc
 
 TARGETS: dict[str, str] = {
     "healthy-v1": "http://demo-healthy-v1:8000",
@@ -151,6 +152,68 @@ class DeploymentStore:
             raise RuntimeError("deployment_state is not initialised")
         return _row_to_snapshot(row)
 
+    async def get_operation_record(self, operation_id) -> Optional[OperationRecord]:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT operation_id, service_id, expected_generation, "
+                "target_revision, result_revision, result_generation, "
+                "result_activated_at, result_predecessor "
+                "FROM deployment_operations WHERE operation_id = $1",
+                operation_id,
+            )
+        return self._row_to_operation(row) if row else None
+
+    async def _reservation_for(self, conn, operation_id) -> Optional[asyncpg.Record]:
+        return await conn.fetchrow(
+            "SELECT operation_id, service_id, scope, status, expected_generation, "
+            "target_revision FROM deployment_reservations WHERE operation_id = $1",
+            operation_id,
+        )
+
+    async def _recovery_authorized(
+        self, conn, current: DeploymentSnapshot, request: SwitchRequest, now: datetime
+    ) -> bool:
+        """Re-validate an approval/operation at the authoritative mutation boundary.
+
+        Loads the persisted operation, approval, and proposal and checks the exact
+        binding (service, expected/current revision, generation, target, TTL, and
+        consumption).  Recovery validation lives here so the internal switch can
+        never be used as an approval bypass by the API or worker.
+        """
+        row = await conn.fetchrow(
+            "SELECT o.status AS op_status, o.target_revision AS op_target, "
+            "a.id AS approval_id, a.service_id AS approval_service, "
+            "a.expected_revision AS approval_revision, "
+            "a.target_revision AS approval_target, a.expires_at, "
+            "a.consumed_by_operation, p.expected_generation, p.current_revision "
+            "FROM recovery_operations o "
+            "JOIN approvals a ON a.id = o.approval_id "
+            "JOIN proposals p ON p.id = a.proposal_id "
+            "WHERE o.id = $1",
+            request.operation_id,
+        )
+        if row is None:
+            return False
+        if row["op_status"] not in ("pending", "executing"):
+            return False
+        if row["approval_service"] != SERVICE_ID:
+            return False
+        if row["approval_revision"] != current.revision:
+            return False
+        if row["approval_target"] != request.target_revision:
+            return False
+        if row["op_target"] != request.target_revision:
+            return False
+        if row["expected_generation"] != request.expected_generation:
+            return False
+        if row["consumed_by_operation"] not in (None, request.operation_id):
+            return False
+        if ensure_utc(row["expires_at"]) <= now:
+            return False
+        if current.predecessor != request.target_revision:
+            return False
+        return True
+
     async def switch(self, request: SwitchRequest) -> SwitchDecision:
         now = datetime.now(timezone.utc)
         async with self._pool.acquire() as conn:
@@ -164,6 +227,26 @@ class DeploymentStore:
                 if state_row is None:
                     raise RuntimeError("deployment_state is not initialised")
                 current = _row_to_snapshot(state_row)
+
+                # Authoritative mutation gate: every switch must present the
+                # active reservation it owns, with matching scope and scope
+                # parameters.  A competing or unauthorized change is refused
+                # before it can touch deployment_state.
+                reservation = await self._reservation_for(conn, request.operation_id)
+                if (
+                    reservation is None
+                    or reservation["status"] != "active"
+                    or reservation["service_id"] != SERVICE_ID
+                    or reservation["scope"] != request.scope
+                    or reservation["expected_generation"] != request.expected_generation
+                    or reservation["target_revision"] != request.target_revision
+                ):
+                    return SwitchDecision(status="unauthorized", snapshot=current)
+
+                if request.scope == "recovery" and not await self._recovery_authorized(
+                    conn, current, request, now
+                ):
+                    return SwitchDecision(status="unauthorized", snapshot=current)
 
                 prior_row = await conn.fetchrow(
                     "SELECT operation_id, service_id, expected_generation, "
@@ -314,14 +397,28 @@ async def _build_store(dsn: str, attempts: int = 30, delay: float = 1.0) -> Depl
     last_error: Optional[BaseException] = None
     for _ in range(attempts):
         try:
-            pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=5)
-            store = DeploymentStore(pool)
-            await store.ensure_schema()
-            return store
+            pool = await asyncpg.create_pool(
+                dsn=dsn, min_size=1, max_size=5, init=_init_json_codecs
+            )
+            # The switch transaction reads reservations/approvals/operations, so
+            # the full versioned schema must exist before control serves traffic.
+            from .db import bootstrap_schema
+
+            await bootstrap_schema(pool)
+            return DeploymentStore(pool)
         except Exception as exc:  # noqa: BLE001 - retried, reported if exhausted
             last_error = exc
             await asyncio.sleep(delay)
     raise RuntimeError(f"PostgreSQL unavailable after {attempts} attempts: {last_error!r}")
+
+
+async def _init_json_codecs(conn: asyncpg.Connection) -> None:
+    import json
+
+    for type_name in ("json", "jsonb"):
+        await conn.set_type_codec(
+            type_name, encoder=json.dumps, decoder=json.loads, schema="pg_catalog"
+        )
 
 
 async def _serve(role: str, dsn: str, port: int, internal_token: str) -> None:

@@ -19,6 +19,7 @@ import pytest_asyncio
 from incident_recovery import db as db_module
 from incident_recovery.contracts import SwitchRequest
 from incident_recovery.gateway import DeploymentStore
+from incident_recovery.repository import IncidentRepository
 
 from .conftest import _host_dsn
 
@@ -67,19 +68,32 @@ async def live() -> LiveStack:
 
 
 async def _restore_healthy() -> None:
-    """Repository-local authoritative restore; only touches deployment_state rows."""
+    """Repository-local authoritative restore through a fault reservation."""
     pool = await db_module.create_pool(_host_dsn())
     try:
+        repo = IncidentRepository(pool)
         store = DeploymentStore(pool)
         snapshot = await store.get_snapshot()
-        if snapshot.revision != HEALTHY:
+        if snapshot.revision == HEALTHY:
+            return
+        operation_id = uuid.uuid4()
+        await repo.reserve(
+            operation_id,
+            scope="fault",
+            expected_generation=snapshot.generation,
+            target_revision=HEALTHY,
+        )
+        try:
             await store.switch(
                 SwitchRequest(
-                    operation_id=uuid.uuid4(),
+                    operation_id=operation_id,
                     expected_generation=snapshot.generation,
                     target_revision=HEALTHY,
+                    scope="fault",
                 )
             )
+        finally:
+            await repo.release_reservation(operation_id)
     finally:
         await pool.close()
 

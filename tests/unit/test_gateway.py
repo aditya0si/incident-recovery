@@ -62,7 +62,10 @@ def test_broken_demo_returns_genuine_functional_failure() -> None:
 
 def test_switch_increments_generation_and_records_predecessor() -> None:
     request = SwitchRequest(
-        operation_id=uuid.uuid4(), expected_generation=1, target_revision="broken-v2"
+        operation_id=uuid.uuid4(),
+        expected_generation=1,
+        target_revision="broken-v2",
+        scope="fault",
     )
     decision = evaluate_switch(_snapshot("healthy-v1", 1), request, None, NOW)
     assert decision.status == "applied"
@@ -73,7 +76,10 @@ def test_switch_increments_generation_and_records_predecessor() -> None:
 
 def test_switch_rejects_stale_generation() -> None:
     request = SwitchRequest(
-        operation_id=uuid.uuid4(), expected_generation=1, target_revision="broken-v2"
+        operation_id=uuid.uuid4(),
+        expected_generation=1,
+        target_revision="broken-v2",
+        scope="fault",
     )
     decision = evaluate_switch(_snapshot("healthy-v1", 5), request, None, NOW)
     assert decision.status == "stale"
@@ -86,7 +92,10 @@ def test_exact_replay_returns_recorded_result_without_second_mutation() -> None:
     applied = evaluate_switch(
         _snapshot("healthy-v1", 1),
         SwitchRequest(
-            operation_id=operation_id, expected_generation=1, target_revision="broken-v2"
+            operation_id=operation_id,
+            expected_generation=1,
+            target_revision="broken-v2",
+            scope="fault",
         ),
         None,
         NOW,
@@ -103,7 +112,10 @@ def test_exact_replay_returns_recorded_result_without_second_mutation() -> None:
     replay = evaluate_switch(
         _snapshot("healthy-v1", 3, "broken-v2"),
         SwitchRequest(
-            operation_id=operation_id, expected_generation=1, target_revision="broken-v2"
+            operation_id=operation_id,
+            expected_generation=1,
+            target_revision="broken-v2",
+            scope="fault",
         ),
         recorded,
         NOW,
@@ -125,7 +137,10 @@ def test_conflicting_replay_is_rejected() -> None:
     decision = evaluate_switch(
         _snapshot("broken-v2", 2, "healthy-v1"),
         SwitchRequest(
-            operation_id=operation_id, expected_generation=2, target_revision="healthy-v1"
+            operation_id=operation_id,
+            expected_generation=2,
+            target_revision="healthy-v1",
+            scope="fault",
         ),
         recorded,
         NOW,

@@ -35,6 +35,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from .contracts import (
     AlertAccepted,
     AlertCreate,
+    ApprovalRequest,
+    ApprovalResult,
+    ApprovalView,
     DeploymentSnapshot,
     EventView,
     EvidenceView,
@@ -42,16 +45,31 @@ from .contracts import (
     FaultResult,
     IncidentDetail,
     IncidentSummary,
+    OperationView,
+    ProposalView,
+    RejectionRequest,
+    RejectionResult,
     SwitchDecision,
+    VerificationView,
+    approval_view,
+    operation_view,
+    proposal_view,
 )
 from .db import bootstrap_schema, create_pool
 from .gateway import DeploymentStore
-from .models import Event, Evidence, Incident
+from .models import (
+    ApprovalStale,
+    Event,
+    Evidence,
+    IllegalStateTransition,
+    Incident,
+    NotFound,
+    Operation,
+    ProposalNotFound,
+    ReservationConflict,
+    SwitchUnreachable,
+)
 from .repository import IncidentRepository
-
-
-class SwitchUnreachable(RuntimeError):
-    """The internal switch could not be reached or returned an unusable body."""
 
 
 class SwitchClient(Protocol):
@@ -61,11 +79,14 @@ class SwitchClient(Protocol):
         operation_id: UUID,
         expected_generation: int,
         target_revision: str,
+        scope: str,
     ) -> SwitchDecision: ...
 
 
 class StoreReader(Protocol):
     async def get_snapshot(self) -> DeploymentSnapshot: ...
+
+    async def get_operation_record(self, operation_id: UUID): ...
 
 
 class HttpSwitchClient:
@@ -82,11 +103,13 @@ class HttpSwitchClient:
         operation_id: UUID,
         expected_generation: int,
         target_revision: str,
+        scope: str,
     ) -> SwitchDecision:
         body = {
             "operation_id": str(operation_id),
             "expected_generation": expected_generation,
             "target_revision": target_revision,
+            "scope": scope,
         }
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
@@ -136,6 +159,24 @@ def _event_view(event: Event) -> EventView:
         kind=event.kind.value,
         payload=event.payload,
         created_at=event.created_at,
+    )
+
+
+def _verification_view(operation: Optional[Operation]) -> Optional[VerificationView]:
+    if operation is None or not operation.result:
+        return None
+    payload = operation.result
+    if "checks" not in payload or "consecutive_successes" not in payload:
+        return None
+    return VerificationView(
+        status=str(payload.get("status", operation.status)),
+        target_revision=operation.target_revision,
+        checks=int(payload.get("checks", 0)),
+        consecutive_successes=int(payload.get("consecutive_successes", 0)),
+        required_streak=int(payload.get("required_streak", 3)),
+        started_at=payload.get("started_at"),
+        finished_at=payload.get("finished_at"),
+        detail=payload.get("detail"),
     )
 
 
@@ -206,12 +247,67 @@ def create_app(
             raise HTTPException(status_code=404, detail="incident_not_found")
         evidence = await repo.list_evidence(incident_id)
         events = await repo.list_events(incident_id, limit=200)
+        proposal = await repo.get_proposal_for_incident(incident_id)
+        approval = await repo.get_approval_for_incident(incident_id)
+        operation = await repo.get_operation_for_incident(incident_id)
         detail = IncidentDetail(
             **_incident_summary(incident).model_dump(),
             evidence=[_evidence_view(e) for e in evidence],
             events=[_event_view(e) for e in events],
+            proposal=proposal_view(proposal) if proposal else None,
+            approval=approval_view(approval) if approval else None,
+            operation=operation_view(operation) if operation else None,
+            verification=_verification_view(operation) if operation else None,
         )
         return detail.model_dump(mode="json")
+
+    @app.post("/incidents/{incident_id}/approve")
+    async def approve_incident(
+        incident_id: UUID,
+        body: ApprovalRequest,
+        _: bool = Depends(require_operator),
+    ) -> dict:
+        try:
+            approval, operation, created = await repo.approve_incident(
+                incident_id, body.proposal_digest, body.actor
+            )
+        except NotFound:
+            raise HTTPException(status_code=404, detail="incident_not_found")
+        except ProposalNotFound:
+            raise HTTPException(status_code=404, detail="proposal_not_found")
+        except ApprovalStale:
+            raise HTTPException(status_code=409, detail="stale_approval")
+        except ReservationConflict:
+            raise HTTPException(status_code=409, detail="deployment_reserved")
+        except IllegalStateTransition:
+            raise HTTPException(status_code=409, detail="invalid_state")
+        result = ApprovalResult(
+            approval=approval_view(approval),
+            operation=operation_view(operation),
+            created=created,
+        )
+        return result.model_dump(mode="json")
+
+    @app.post("/incidents/{incident_id}/reject")
+    async def reject_incident(
+        incident_id: UUID,
+        body: RejectionRequest,
+        _: bool = Depends(require_operator),
+    ) -> dict:
+        try:
+            incident = await repo.reject_incident(
+                incident_id,
+                body.actor,
+                reason=body.reason,
+                proposal_digest=body.proposal_digest,
+            )
+        except NotFound:
+            raise HTTPException(status_code=404, detail="incident_not_found")
+        except IllegalStateTransition:
+            raise HTTPException(status_code=409, detail="invalid_state")
+        return RejectionResult(
+            incident_id=incident.id, state=incident.state.value, actor=body.actor
+        ).model_dump(mode="json")
 
     @app.get("/incidents/{incident_id}/events")
     async def incident_events(
@@ -258,26 +354,46 @@ def create_app(
                 status="already_active", snapshot=snapshot, reconciled=True
             ).model_dump(mode="json")
 
+        # The persisted reservation is the authoritative mutation token.  It is
+        # created atomically before the switch and validated inside the gateway
+        # switch transaction, closing the check-then-act race with a recovery
+        # that may claim the deployment concurrently.
+        operation_id = uuid4()
         try:
-            decision = await switch_client.switch(
-                operation_id=uuid4(),
+            await repo.reserve(
+                operation_id,
+                scope="fault",
                 expected_generation=snapshot.generation,
                 target_revision=body.target_revision,
             )
-        except SwitchUnreachable:
-            actual = await store.get_snapshot()
-            if actual.revision == body.target_revision:
-                return FaultResult(
-                    status="reconciled", snapshot=actual, reconciled=True
-                ).model_dump(mode="json")
-            raise HTTPException(status_code=502, detail="switch_unreachable")
+        except ReservationConflict:
+            raise HTTPException(status_code=409, detail="deployment_reserved")
+
+        try:
+            try:
+                decision = await switch_client.switch(
+                    operation_id=operation_id,
+                    expected_generation=snapshot.generation,
+                    target_revision=body.target_revision,
+                    scope="fault",
+                )
+            except SwitchUnreachable:
+                record = await store.get_operation_record(operation_id)
+                if record is not None:
+                    return FaultResult(
+                        status="reconciled", snapshot=record.snapshot, reconciled=True
+                    ).model_dump(mode="json")
+                raise HTTPException(status_code=502, detail="switch_unreachable")
+        finally:
+            await repo.release_reservation(operation_id)
 
         if decision.status in ("applied", "replayed"):
             return FaultResult(
                 status=decision.status, snapshot=decision.snapshot, reconciled=False
             ).model_dump(mode="json")
 
-        # Stale/conflict: report the authoritative state, never a false success.
+        # Stale/conflict/unauthorized: report the authoritative state, never a
+        # false success.
         actual = await store.get_snapshot()
         raise HTTPException(
             status_code=409,
