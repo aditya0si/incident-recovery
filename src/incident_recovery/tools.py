@@ -35,10 +35,43 @@ _SENSITIVE_KEY = (
     r"model[_-]?api[_-]?key|internal[_-]?token|operator[_-]?token"
 )
 
+# A quoted value may contain spaces and backslash escapes; an unquoted value ends
+# at whitespace, a quote, a comma, or a semicolon.  Both are supported so a
+# ``password="two word secret"`` assignment cannot leak its trailing words.
+_QUOTED_OR_BARE_VALUE = (
+    r"\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s\"',;]+"
+)
+
+
+def _redact_scheme(match: "re.Match[str]") -> str:
+    return f"{match.group(1)}{_REDACTED}"
+
+
+def _redact_assignment(match: "re.Match[str]") -> str:
+    key, key_quote, separator, value = match.groups()
+    if value[:1] in ("'", '"'):
+        marker = value[0] + _REDACTED + value[0]
+    else:
+        marker = _REDACTED
+    return f"{key}{key_quote}{separator}{marker}"
+
+
 _SECRET_PATTERNS = (
-    re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)\S+"),
-    re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-]{6,}"),
-    re.compile(rf"(?i)({_SENSITIVE_KEY})\s*[:=]\s*[\"']?([^\s\"',;]+)"),
+    (
+        re.compile(r"(?i)(authorization\s*[:=]\s*(?:bearer|basic|token)\s+)\S+"),
+        _redact_scheme,
+    ),
+    (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-]{6,}"), _redact_scheme),
+    # ``key``/``"key"`` followed by ``:`` or ``=`` and a quoted or bare value.
+    # The leading quote of a JSON key is outside the match, so ``"password": ...``
+    # is still recognised.  The value keeps its quotes so redacted JSON stays
+    # well-formed.  Scope: best-effort pattern redaction, not a DLP guarantee.
+    (
+        re.compile(
+            rf"(?i)({_SENSITIVE_KEY})([\"']?)(\s*[:=]\s*)({_QUOTED_OR_BARE_VALUE})"
+        ),
+        _redact_assignment,
+    ),
 )
 
 _SENSITIVE_ENV_VARS = (
@@ -50,18 +83,19 @@ _SENSITIVE_ENV_VARS = (
 
 
 def redact_secrets(text: str, *, extra: Iterable[str] = ()) -> str:
-    """Redact bearer tokens, credential assignments, and known secret values."""
+    """Redact bearer/basic tokens, credential assignments, and known values.
+
+    Scope (best effort, **not** a DLP guarantee): it recognises bearer/basic/token
+    authorization headers, standalone bearer tokens, and ``key``/``"key"``
+    assignments for secret-shaped names followed by a quoted (spaces/escapes
+    allowed) or bare value, including JSON-encoded text and nested JSON/list
+    payloads embedded in a string.  It also replaces any configured secret value
+    verbatim.  It deliberately does **not** claim to catch arbitrary obfuscation.
+    """
 
     redacted = text
-    for pattern in _SECRET_PATTERNS:
-        redacted = pattern.sub(
-            lambda match: (
-                f"{match.group(1)}{_REDACTED}"
-                if match.lastindex == 1
-                else f"{match.group(1)}={_REDACTED}"
-            ),
-            redacted,
-        )
+    for pattern, repl in _SECRET_PATTERNS:
+        redacted = pattern.sub(repl, redacted)
     values = list(extra)
     for name in _SENSITIVE_ENV_VARS:
         value = os.environ.get(name)

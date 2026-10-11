@@ -173,21 +173,28 @@ class DeploymentStore:
         )
 
     async def _recovery_authorized(
-        self, conn, current: DeploymentSnapshot, request: SwitchRequest, now: datetime
-    ) -> bool:
+        self, conn, current: DeploymentSnapshot, request: SwitchRequest
+    ) -> tuple[bool, Optional[datetime]]:
         """Re-validate an approval/operation at the authoritative mutation boundary.
 
         Loads the persisted operation, approval, and proposal and checks the exact
         binding (service, expected/current revision, generation, target, TTL, and
         consumption).  Recovery validation lives here so the internal switch can
         never be used as an approval bypass by the API or worker.
+
+        The admission time is sampled with ``clock_timestamp()`` **in the same
+        query** as the approval row, so it is evaluated only after every lock wait
+        the ``SELECT ... JOIN`` may incur.  A clock sampled before an awaited query
+        can never authorise an approval that expired while that query blocked.
+        Returns ``(authorized, admission_time)``.
         """
         row = await conn.fetchrow(
             "SELECT o.status AS op_status, o.target_revision AS op_target, "
             "a.id AS approval_id, a.service_id AS approval_service, "
             "a.expected_revision AS approval_revision, "
             "a.target_revision AS approval_target, a.expires_at, "
-            "a.consumed_by_operation, p.expected_generation, p.current_revision "
+            "a.consumed_by_operation, p.expected_generation, p.current_revision, "
+            "clock_timestamp() AS admission_now "
             "FROM recovery_operations o "
             "JOIN approvals a ON a.id = o.approval_id "
             "JOIN proposals p ON p.id = a.proposal_id "
@@ -195,26 +202,27 @@ class DeploymentStore:
             request.operation_id,
         )
         if row is None:
-            return False
+            return False, None
+        now = ensure_utc(row["admission_now"])
         if row["op_status"] not in ("pending", "executing"):
-            return False
+            return False, now
         if row["approval_service"] != SERVICE_ID:
-            return False
+            return False, now
         if row["approval_revision"] != current.revision:
-            return False
+            return False, now
         if row["approval_target"] != request.target_revision:
-            return False
+            return False, now
         if row["op_target"] != request.target_revision:
-            return False
+            return False, now
         if row["expected_generation"] != request.expected_generation:
-            return False
+            return False, now
         if row["consumed_by_operation"] not in (None, request.operation_id):
-            return False
+            return False, now
         if ensure_utc(row["expires_at"]) <= now:
-            return False
+            return False, now
         if current.predecessor != request.target_revision:
-            return False
-        return True
+            return False, now
+        return True, now
 
     async def switch(self, request: SwitchRequest) -> SwitchDecision:
         async with self._pool.acquire() as conn:
@@ -264,31 +272,55 @@ class DeploymentStore:
                     return SwitchDecision(status="unauthorized", snapshot=current)
 
                 # Refresh the authoritative admission time *after* every lock
-                # wait, immediately before the mutation decision.  Using the
-                # database ``clock_timestamp()`` (not the transaction ``now()``,
-                # which is fixed at transaction start) means an approval that
-                # expired while this switch waited on the row lock is seen as
-                # expired and can never be applied.
-                now = await conn.fetchval("SELECT clock_timestamp()")
-
-                if request.scope == "recovery" and not await self._recovery_authorized(
-                    conn, current, request, now
-                ):
-                    return SwitchDecision(status="unauthorized", snapshot=current)
+                # wait, immediately before the mutation decision.  For a recovery
+                # switch the clock is sampled atomically with the approval row
+                # (see ``_recovery_authorized``), so an approval that expired
+                # while the switch waited on the row lock or on the approval
+                # SELECT is seen as expired and can never be applied.  For any
+                # other scope the database ``clock_timestamp()`` (not the
+                # transaction ``now()``, which is fixed at transaction start) is
+                # read after the reservation check.
+                if request.scope == "recovery":
+                    authorized, now = await self._recovery_authorized(conn, current, request)
+                    if not authorized:
+                        return SwitchDecision(status="unauthorized", snapshot=current)
+                else:
+                    now = await conn.fetchval("SELECT clock_timestamp()")
 
                 decision = evaluate_switch(current, request, prior, now)
 
                 if decision.status == "applied":
                     snap = decision.snapshot
-                    await conn.execute(
-                        "UPDATE deployment_state SET revision = $1, generation = $2, "
-                        "activated_at = $3, predecessor = $4 WHERE service_id = $5",
-                        snap.revision,
-                        snap.generation,
-                        snap.activated_at,
-                        snap.predecessor,
-                        SERVICE_ID,
-                    )
+                    if request.scope == "recovery":
+                        # Final atomic expiry predicate: the mutation itself is
+                        # gated on the approval still being live at the instant it
+                        # is written, so no further (awaited) round-trip can leak
+                        # an expired approval into ``deployment_state``.
+                        updated = await conn.execute(
+                            "UPDATE deployment_state SET revision = $1, generation = $2, "
+                            "activated_at = $3, predecessor = $4 WHERE service_id = $5 "
+                            "AND EXISTS (SELECT 1 FROM recovery_operations o "
+                            "JOIN approvals a ON a.id = o.approval_id "
+                            "WHERE o.id = $6 AND a.expires_at > clock_timestamp())",
+                            snap.revision,
+                            snap.generation,
+                            snap.activated_at,
+                            snap.predecessor,
+                            SERVICE_ID,
+                            request.operation_id,
+                        )
+                        if updated == "UPDATE 0":
+                            return SwitchDecision(status="unauthorized", snapshot=current)
+                    else:
+                        await conn.execute(
+                            "UPDATE deployment_state SET revision = $1, generation = $2, "
+                            "activated_at = $3, predecessor = $4 WHERE service_id = $5",
+                            snap.revision,
+                            snap.generation,
+                            snap.activated_at,
+                            snap.predecessor,
+                            SERVICE_ID,
+                        )
                     await conn.execute(
                         "INSERT INTO deployment_operations (operation_id, service_id, "
                         "expected_generation, target_revision, result_revision, "

@@ -58,7 +58,7 @@ from .models import (
     utcnow,
     validate_payload,
 )
-from .tools import redact_structure
+from .tools import redact_secrets, redact_structure
 
 _OPERATION_COLS = (
     "id, incident_id, approval_id, status, target_revision, result, created_at, "
@@ -70,6 +70,18 @@ _COLS = (
     "detected_at, updated_at, version, lease_owner, lease_expires_at"
 )
 _COLS_Q = ", ".join(f"incidents.{column.strip()}" for column in _COLS.split(","))
+
+
+def _redact_text(value: Optional[str]) -> Optional[str]:
+    """Redact secret-shaped text before it is written to a text column.
+
+    Error/trace strings are persisted verbatim in ``last_error`` columns, so they
+    flow through the same shared redaction as structured payloads; a synthetic
+    ``password=...`` in an error message must not survive.
+    """
+
+    return redact_secrets(value) if value is not None else None
+
 
 
 def _row_to_incident(row: asyncpg.Record) -> Incident:
@@ -599,7 +611,7 @@ class IncidentRepository:
             operation_id,
             status,
             body,
-            last_error,
+            _redact_text(last_error),
             bump_attempts,
             mark_verified,
         )
@@ -1116,7 +1128,7 @@ class IncidentRepository:
                     "result = COALESCE($4::jsonb, result), updated_at = now() WHERE id = $1",
                     operation_id,
                     OPERATION_FAILED,
-                    error,
+                    _redact_text(error),
                     result_body,
                 )
                 await conn.execute(
@@ -1292,7 +1304,7 @@ class IncidentRepository:
             incident_id,
             epoch,
             state,
-            last_error,
+            _redact_text(last_error),
         )
         return _row_to_investigation_run(row) if row else None
 

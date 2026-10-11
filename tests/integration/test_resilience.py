@@ -366,8 +366,70 @@ async def test_switch_expiry_after_lock_wait_cannot_mutate(
     )
 
 
-# --- Finding 2: crash window reconciliation -----------------------------------
+# --- Round 2 Finding 2: expiry must be enforced after the awaited approval SELECT
 
+
+async def test_expiry_enforced_after_awaited_approval_select(
+    test_db: IntegrationDB,
+) -> None:
+    """An approval that expires while the recovery admission SELECT waits is refused.
+
+    A competing transaction holds ``ACCESS EXCLUSIVE`` on ``approvals``, so the
+    switch blocks inside the awaited approval ``SELECT ... JOIN``.  The approval
+    expires during that wait.  The authoritative admission time must be sampled
+    *after* the SELECT returns (atomically in the same query), so the switch is
+    refused and performs no mutation.  Pre-fix, the clock was sampled before the
+    SELECT and the switch applied with three writes.
+    """
+
+    repo = IncidentRepository(test_db.pool)
+    store = DeploymentStore(test_db.pool)
+    incident, proposal = await _awaiting_incident_with_proposal(repo, store)
+    _, operation, _ = await repo.approve_incident(
+        incident.id, proposal.digest, "alice", ttl_seconds=1, now=utcnow()
+    )
+
+    blocker = await test_db.pool.acquire()
+    await blocker.execute("BEGIN")
+    await blocker.execute("LOCK TABLE approvals IN ACCESS EXCLUSIVE MODE")
+    try:
+        switch_task = asyncio.create_task(
+            store.switch(
+                SwitchRequest(
+                    operation_id=operation.id,
+                    expected_generation=operation.expected_generation,
+                    target_revision=operation.target_revision,
+                    scope="recovery",
+                )
+            )
+        )
+        # Let the switch block on the approval SELECT, then outlive the 1s TTL.
+        await asyncio.sleep(0.3)
+        await asyncio.sleep(1.3)
+    finally:
+        await blocker.execute("ROLLBACK")
+        await test_db.pool.release(blocker)
+
+    decision = await asyncio.wait_for(switch_task, timeout=10)
+    assert decision.status == "unauthorized"
+    assert (await store.get_snapshot()).revision == BROKEN
+    assert (
+        await repo.pool.fetchval(
+            "SELECT count(*) FROM deployment_operations WHERE operation_id = $1",
+            operation.id,
+        )
+        == 0
+    )
+    assert (
+        await repo.pool.fetchval(
+            "SELECT count(*) FROM deployment_history WHERE operation_id = $1",
+            operation.id,
+        )
+        == 0
+    )
+
+
+# --- Finding 2: crash window reconciliation -----------------------------------
 
 async def _seed_durable_switch_without_execution(
     repo: IncidentRepository, store: DeploymentStore
@@ -553,3 +615,80 @@ async def test_repository_redacts_nested_secrets_at_persistence(
 
     rows = await repo.list_evidence(incident.id)
     assert sentinel not in json.dumps([row.payload for row in rows])
+
+
+# --- Round 2 Finding 3: raw error/trace text write sinks ----------------------
+
+
+async def test_set_operation_status_redacts_last_error(
+    test_db: IntegrationDB,
+) -> None:
+    """The reproduced defect: the raw ``last_error`` SQL parameter leaked."""
+
+    repo = IncidentRepository(test_db.pool)
+    store = DeploymentStore(test_db.pool)
+    incident, proposal = await _awaiting_incident_with_proposal(repo, store)
+    _, operation, _ = await repo.approve_incident(
+        incident.id, proposal.digest, "alice", now=BASE
+    )
+
+    updated = await repo.set_operation_status(
+        operation.id,
+        "executing",
+        last_error="password=" + "SYNTHETIC_SENTINEL",
+        result={"password": "SYNTHETIC_SENTINEL", "status": "ok"},
+    )
+    assert "SYNTHETIC_SENTINEL" not in (updated.last_error or "")
+    assert updated.result["password"] == "[REDACTED]"
+    assert updated.result["status"] == "ok"
+
+    benign = await repo.set_operation_status(
+        operation.id, "executing", last_error="switch_unauthorized"
+    )
+    assert benign.last_error == "switch_unauthorized"
+
+
+async def test_fail_recovery_redacts_error_and_event(test_db: IntegrationDB) -> None:
+    repo = IncidentRepository(test_db.pool)
+    store = DeploymentStore(test_db.pool)
+    incident, proposal = await _awaiting_incident_with_proposal(repo, store)
+    _, operation, _ = await repo.approve_incident(
+        incident.id, proposal.digest, "alice", now=BASE
+    )
+    await repo.claim_next_recovery("worker-a", lease_seconds=60, now=BASE)
+
+    await repo.fail_recovery(
+        incident.id,
+        "worker-a",
+        operation.id,
+        error='password="synthetic alpha bravo"',
+        result={"api_key": "SYNTHETIC_SENTINEL", "reason": "boom"},
+        now=BASE,
+    )
+    stored = await repo.get_operation(operation.id)
+    assert "synthetic" not in (stored.last_error or "")
+    assert "alpha" not in (stored.last_error or "")
+    events = await repo.list_events(incident.id)
+    blob = json.dumps([event.payload for event in events])
+    assert "synthetic" not in blob
+    assert "SYNTHETIC_SENTINEL" not in blob
+
+
+async def test_set_investigation_run_state_redacts_last_error(
+    test_db: IntegrationDB,
+) -> None:
+    repo = IncidentRepository(test_db.pool)
+    incident, _ = await repo.ingest_alert(
+        f"runerr-{uuid.uuid4()}", "demo-api", "x", {}
+    )
+    await repo.claim_next_investigation("w1", lease_seconds=180, now=utcnow())
+    run = await repo.ensure_investigation_run(incident.id, "scripted:test", 120, now=utcnow())
+
+    await repo.set_investigation_run_state(
+        incident.id, run.epoch, "escalated",
+        last_error="token=SYNTHETIC_SENTINEL", now=utcnow(),
+    )
+    reloaded = await repo.get_investigation_run(incident.id, run.epoch)
+    assert reloaded is not None
+    assert "SYNTHETIC_SENTINEL" not in (reloaded.last_error or "")
+    assert "token" in (reloaded.last_error or "")

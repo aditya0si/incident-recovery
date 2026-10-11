@@ -74,3 +74,38 @@ def test_vitest_gate_accepts_real_passing_run() -> None:
     ok, detail = verify._test_gate(counts)
     assert ok is True
     assert "31" in detail
+
+
+# --- Finding 4 (round 2): unexecuted/todo tests must fail a required gate -------
+
+
+def test_vitest_gate_rejects_todo_tests() -> None:
+    """The exact reproduced defect: ``Tests 1 passed | 2 todo (3)`` passed."""
+
+    counts = verify._vitest_counts("      Tests  1 passed | 2 todo (3)")
+    assert counts.get("passed") == 1 and counts.get("todo") == 2
+    ok, detail = verify._test_gate(counts)
+    assert ok is False
+    assert "todo" in detail or "unexecuted" in detail
+
+
+def test_vitest_gate_rejects_unexecuted_total_mismatch() -> None:
+    counts = verify._vitest_counts("      Tests  1 passed (3)")
+    assert verify._test_gate(counts)[0] is False
+
+
+def test_vitest_gate_rejects_skipped_with_passes() -> None:
+    counts = verify._vitest_counts("      Tests  30 passed | 1 skipped (31)")
+    assert verify._test_gate(counts)[0] is False
+
+
+def test_pytest_gate_rejects_deselected_tests() -> None:
+    counts = verify._pytest_counts("10 passed, 3 deselected in 1.0s")
+    assert counts.get("deselected") == 3
+    assert verify._pytest_gate(counts)[0] is False
+
+
+def test_pytest_gate_accepts_clean_pass_control() -> None:
+    ok, detail = verify._pytest_gate(verify._pytest_counts("38 passed in 1.23s"))
+    assert ok is True
+    assert "38" in detail

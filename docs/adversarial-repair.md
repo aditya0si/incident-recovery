@@ -203,3 +203,108 @@ reports its executed count. Optional checks (the live-model check) are exempt.
 - The contention regression uses a bounded real-time lock wait (~1.4s) and the
   injected-clock probe tests simulate slow probes; the real-client control bounds
   a real slow HTTP probe.
+
+# Round 2 — second adversarial repair (generalized gaps)
+
+The parent independently reproduced four further gaps against the committed
+`c2932f0` source. Each was fixed with RED→GREEN tests, not instance-only regex
+patches. Every RED result below was produced by running the named new test
+against the pre-fix source (the test existed before the fix); no count or status
+is invented.
+
+| # | Severity | Defect | Regression test(s) |
+| --- | --- | --- | --- |
+| 1 | MAJOR | Redaction missed quoted keys/values and JSON-encoded secret lines, leaking trailing words | `test_redact_secrets_redacts_json_encoded_line`, `test_redact_secrets_redacts_quoted_key_and_value_variants`, `test_redact_secrets_redacts_quoted_value_with_spaces`, `test_redact_secrets_redacts_nested_json_and_lists`, `test_redact_secrets_redacts_escaped_quoted_value`, `test_redact_secrets_redacts_header_and_scheme_forms`, `test_tool_runner_logs_redacts_*` |
+| 2 | MAJOR | Admission clock was sampled before the awaited approval `SELECT ... JOIN`; an approval expiring during that wait was still applied (3 writes) | `test_expiry_enforced_after_awaited_approval_select` |
+| 3 | MAJOR | `last_error` text columns bypassed redaction while structured results were cleaned | `test_set_operation_status_redacts_last_error`, `test_fail_recovery_redacts_error_and_event`, `test_set_investigation_run_state_redacts_last_error` |
+| 4 | MINOR | The required vitest gate accepted `Tests 1 passed | 2 todo (3)` as success | `test_vitest_gate_rejects_todo_tests`, `test_vitest_gate_rejects_unexecuted_total_mismatch`, `test_pytest_gate_rejects_deselected_tests` |
+
+## 1 — MAJOR: generalized secret-text redaction
+
+**Root cause.** `redact_secrets` required a secret-shaped key immediately followed
+by `:`/`=`. A JSON-encoded log line `json.dumps({'password': 'SYNTHETIC_SENTINEL'})`
+has a closing quote between the key and the colon, so it never matched. A quoted
+value with spaces (`password="two word synthetic secret"`) matched only the first
+word, leaking the trailing words.
+
+**Fix.** `redact_secrets` now recognises bearer/basic/token authorization schemes,
+and `key` / `"key"` assignments for secret-shaped names followed by a quoted value
+(spaces and backslash escapes allowed) or a bare value, including JSON-encoded
+text and nested JSON/list payloads embedded in a string. Quoted values keep their
+quotes so redacted JSON stays well-formed. `redact_structure` is still applied
+first in `ToolRunner.observe`, so redaction precedes truncation and a truncated
+tail can never contain a secret. This is documented as best-effort pattern
+redaction, **not** a DLP guarantee.
+
+**Evidence.**
+
+- RED (pre-fix): `8 failed, 1 passed`; representative
+  `AssertionError` showing `'two' is contained here: ... REDACTED] two word value`.
+- GREEN: `tests/unit/test_tools.py` `24 passed`, including the exact
+  `json.dumps({'password': ...})` reproduction.
+
+## 2 — MAJOR: expiry enforced after the awaited approval SELECT
+
+**Root cause.** `DeploymentStore.switch` sampled `clock_timestamp()` *before*
+`_recovery_authorized` ran its awaited `recovery_operations ⋈ approvals ⋈ proposals`
+query. If that query blocked (e.g. behind an `ACCESS EXCLUSIVE` lock or a slow
+connection), the loaded approval was compared against a pre-wait clock and an
+approval that expired during the wait was still applied.
+
+**Fix.** `_recovery_authorized` now selects `clock_timestamp()` in the *same*
+query as the approval row, so the admission time is evaluated only after every
+lock wait the SELECT incurs, and compares the loaded `expires_at` against it.
+The `applied` mutation for `recovery` scope additionally carries an atomic
+`EXISTS (... a.expires_at > clock_timestamp())` predicate, so no further awaited
+round-trip can write an expired approval into `deployment_state`. Exact durable
+replay is still checked first and is unaffected.
+
+**Real PostgreSQL contention regression.** `test_expiry_enforced_after_awaited_approval_select`
+holds `ACCESS EXCLUSIVE` on `approvals` from a competing connection, starts the
+switch (which blocks inside the approval SELECT), waits past the 1s TTL, releases
+the lock, and asserts the switch is `unauthorized` and neither
+`deployment_operations` nor `deployment_history` gained a row.
+
+- RED (pre-fix): `AssertionError: assert 'applied' == 'unauthorized'`
+- GREEN (fixed): `1 passed`; full `tests/integration` `73 passed`.
+
+## 3 — MAJOR: redact every error/trace text write sink
+
+**Root cause.** `set_operation_status` passed `last_error` as a raw SQL
+parameter; `fail_recovery` passed `error` raw to the `last_error` column and
+`set_investigation_run_state` passed `last_error` raw. The structured `result`
+dictionary was redacted, but the text columns were not, so a synthetic
+`password=SYNTHETIC_SENTINEL` survived in the durable row.
+
+**Fix.** A shared repository helper `_redact_text` runs `redact_secrets` on every
+textual error column (`recovery_operations.last_error`,
+`investigation_runs.last_error`, `fail_recovery` error). Event payloads already
+flow through `redact_structure`, which also redacts strings. Provider adapter
+errors remain fixed identifier strings.
+
+**Evidence.**
+
+- RED (pre-fix): `assert 'SYNTHETIC_SENTINEL' not in 'token=SYNTHETIC_SENTINEL'`
+  and the sibling operation/failure assertions failed (`3 failed`).
+- GREEN: `3 passed`; benign control `last_error == "switch_unauthorized"` is
+  preserved unchanged.
+
+## 4 — MINOR: required test gates must reject todo/unexecuted tests
+
+**Root cause.** `_test_gate` only rejected zero-test, skipped, and failed runs.
+Vitest reports planned-but-unimplemented tests as `todo`, which the gate ignored:
+`Tests 1 passed | 2 todo (3)` was reported as success with
+`{'passed': 1, 'todo': 2}`.
+
+**Fix.** `_vitest_counts` also parses the total (`(3)`) and `_test_gate` fails on
+any `todo` count or a passed+failed+skipped+todo total mismatch. `_pytest_counts`
+now recognises `deselected`, and `_pytest_gate` fails on deselected/unexecuted
+tests as well as skips. A genuinely clean `31 passed (31)` still passes.
+
+**Evidence.**
+
+- RED (pre-fix): `3 failed` (`test_vitest_gate_rejects_todo_tests`,
+  `test_vitest_gate_rejects_unexecuted_total_mismatch`,
+  `test_pytest_gate_rejects_deselected_tests`).
+- GREEN: `tests/unit/test_verify_runner.py` `13 passed`.
+

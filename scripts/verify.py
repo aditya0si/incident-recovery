@@ -202,7 +202,16 @@ def _command_string(argv: list[str]) -> str:
 
 def _pytest_counts(output: str) -> dict:
     counts: dict[str, int] = {}
-    for label in ("passed", "failed", "error", "errors", "skipped", "xfailed", "xpassed"):
+    for label in (
+        "passed",
+        "failed",
+        "error",
+        "errors",
+        "skipped",
+        "deselected",
+        "xfailed",
+        "xpassed",
+    ):
         match = re.search(rf"(\d+) {label}\b", output)
         if match:
             counts[label.rstrip("s") if label == "errors" else label] = int(match.group(1))
@@ -214,9 +223,10 @@ def _pytest_counts(output: str) -> dict:
 def _pytest_gate(counts: dict) -> tuple[bool, str]:
     """Decide whether a pytest run actually executed passing tests.
 
-    A zero-test run, a skipped-only run, a collection error, or any failing test
-    can never be reported as success.  Required suites must execute at least one
-    passing test and skip nothing; a suite that did not run is a failure, not a
+    A zero-test run, a skipped-only run, a run with deselected/unexecuted tests, a
+    collection error, or any failing test can never be reported as success.
+    Required suites must execute at least one passing test and leave nothing
+    skipped, deselected, or errored; a suite that did not run is a failure, not a
     pass.
     """
 
@@ -224,10 +234,13 @@ def _pytest_gate(counts: dict) -> tuple[bool, str]:
     failed = counts.get("failed", 0)
     errors = counts.get("error", 0)
     skipped = counts.get("skipped", 0)
+    deselected = counts.get("deselected", 0)
     if failed or errors:
         return False, f"{failed + errors} failing/error test(s)"
     if skipped:
         return False, f"{skipped} skipped test(s)"
+    if deselected:
+        return False, f"{deselected} deselected/unexecuted test(s)"
     if counts.get("no_tests_ran") or passed == 0:
         return False, "no tests executed"
     return True, f"{passed} passed"
@@ -245,22 +258,33 @@ def _vitest_counts(output: str) -> dict:
         match = re.search(rf"(\d+)\s+{label}\b", line)
         if match:
             counts[label] = int(match.group(1))
+    total = re.search(r"\((\d+)\)\s*$", line)
+    if total:
+        counts["total"] = int(total.group(1))
     return counts
 
 
 def _test_gate(counts: dict) -> tuple[bool, str]:
     """Decide whether a JS/TS test run actually executed passing tests.
 
-    Mirrors :func:`_pytest_gate`: zero tests, skips, or failures cannot pass.
+    Mirrors :func:`_pytest_gate`: zero tests, skips, todo/unexecuted tests, a
+    total-count mismatch, or failures cannot pass.
     """
 
     passed = counts.get("passed", 0)
     failed = counts.get("failed", 0)
     skipped = counts.get("skipped", 0)
+    todo = counts.get("todo", 0)
     if failed:
         return False, f"{failed} failing test(s)"
     if skipped:
         return False, f"{skipped} skipped test(s)"
+    if todo:
+        return False, f"{todo} todo/unexecuted test(s)"
+    total = counts.get("total")
+    if total is not None and passed + failed + skipped + todo < total:
+        unexecuted = total - (passed + failed + skipped + todo)
+        return False, f"{unexecuted} unexecuted test(s) of {total}"
     if passed == 0:
         return False, "no tests executed"
     return True, f"{passed} passed"

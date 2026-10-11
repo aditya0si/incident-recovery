@@ -19,6 +19,7 @@ from incident_recovery.tools import (
     MAX_RESPONSE_BYTES,
     ToolRunner,
     _bounded_json,
+    redact_secrets,
     redact_structure,
 )
 
@@ -208,6 +209,115 @@ def test_tool_runner_observe_logs_redacts_nested_secret_keys() -> None:
         finally:
             await client.aclose()
         assert SENTINEL not in json.dumps(observation.summary)
+
+    asyncio.run(run())
+
+
+# --- Finding 1 (round 2): structured/quoted secret text in log strings --------
+
+
+def test_redact_secrets_redacts_json_encoded_line() -> None:
+    """The exact reproduced defect: ``json.dumps({'password': ...})`` survives."""
+
+    text = json.dumps({"password": SENTINEL})
+    result = redact_secrets(text)
+    assert SENTINEL not in result
+    assert "password" in result
+    assert "[REDACTED]" in result
+
+
+def test_redact_secrets_redacts_quoted_key_and_value_variants() -> None:
+    for text in (
+        json.dumps({"password": SENTINEL}),
+        json.dumps({"api_key": SENTINEL}),
+        '{"Authorization": "' + SENTINEL + '"}',
+        "password: " + SENTINEL,
+        "PASSWORD=" + SENTINEL,
+        "Api-Key:'" + SENTINEL + "'",
+    ):
+        assert SENTINEL not in redact_secrets(text), text
+
+
+def test_redact_secrets_redacts_quoted_value_with_spaces() -> None:
+    """A quoted multi-word value must not leak its trailing words."""
+
+    result = redact_secrets('password="synthetic alpha bravo"')
+    for word in ("synthetic", "alpha", "bravo"):
+        assert word not in result
+    assert "[REDACTED]" in result
+
+
+def test_redact_secrets_redacts_nested_json_and_lists() -> None:
+    text = json.dumps(
+        {"entries": [{"api_key": SENTINEL}, {"token": SENTINEL}], "ok": 1}
+    )
+    result = redact_secrets(text)
+    assert SENTINEL not in result
+    assert '"ok"' in result
+
+
+def test_redact_secrets_redacts_escaped_quoted_value() -> None:
+    text = 'password="pa\\"ss ' + SENTINEL + '"'
+    result = redact_secrets(text)
+    assert SENTINEL not in result
+
+
+def test_redact_secrets_redacts_header_and_scheme_forms() -> None:
+    text = "Authorization: Basic basiccredential123"
+    assert "basiccredential123" not in redact_secrets(text)
+    assert SENTINEL not in redact_secrets("X-Internal-Token: " + SENTINEL)
+    assert SENTINEL not in redact_secrets("operator_token=" + SENTINEL)
+
+
+def test_redact_secrets_preserves_nonsecret_text_controls() -> None:
+    text = "http_status: 503 revision=broken-v2 message=functional_failure"
+    assert redact_secrets(text) == text
+
+
+def test_tool_runner_logs_redacts_json_secret_before_truncation() -> None:
+    secret_line = json.dumps({"password": SENTINEL})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"lines": [{"message": secret_line + " " + "x" * 20000}]},
+        )
+
+    async def run() -> None:
+        client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://gateway.test"
+        )
+        runner = ToolRunner(repo=None, gateway_url="http://gateway.test", client=client)
+        try:
+            observation = await runner.observe(ToolRequest(tool="logs", lines=5))
+        finally:
+            await client.aclose()
+        blob = json.dumps(observation.summary)
+        assert SENTINEL not in blob
+        assert len(observation.summary.__repr__()) < 9000
+
+    asyncio.run(run())
+
+
+def test_tool_runner_logs_redacts_quoted_trailing_words() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"lines": [{"message": 'password="synthetic alpha bravo"'}]},
+        )
+
+    async def run() -> None:
+        client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://gateway.test"
+        )
+        runner = ToolRunner(repo=None, gateway_url="http://gateway.test", client=client)
+        try:
+            observation = await runner.observe(ToolRequest(tool="logs", lines=5))
+        finally:
+            await client.aclose()
+        blob = json.dumps(observation.summary)
+        for word in ("synthetic", "alpha", "bravo"):
+            assert word not in blob
 
     asyncio.run(run())
 
