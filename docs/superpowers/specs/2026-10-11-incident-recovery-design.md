@@ -1,6 +1,6 @@
 # Incident Investigation & Recovery — v1 Design
 
-Status: design approved in conversation; written specification awaiting user review.
+Status: written specification approved by user; implementation plan awaiting user review.
 
 ## Purpose and scope
 Build a reproducible, local Docker portfolio system demonstrating evidence-backed agent investigation, approval-gated recovery, durable workflows, and independently verified outcomes. Hermes owns orchestration and review; OpenCode using opencode-go/deepseek-v4.1-flash owns production and test implementation. No publishing or cloud deployment is authorized.
