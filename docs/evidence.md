@@ -6,10 +6,9 @@ counts: every number below is copied from the machine-readable report produced b
 the verification driver at `.hermes/evidence/verify/report.json` (logs alongside
 it under `.hermes/evidence/verify/logs/`).
 
-- **Source revision:** `6e32c2ca3aae40c3b1b84369cc3065dd7a69095b`
-  (`feat/incident-recovery`, working tree dirty at run time because this
-  milestone's files were not yet committed)
-- **Report generated:** `2026-10-11T17:12:11Z` → `2026-10-11T17:18:50Z` (UTC)
+- **Source revision:** `35e1584f015352df39e11d881b245f2929adcffc`
+  (`feat/incident-recovery`, clean working tree at run time)
+- **Report generated:** `2026-10-11T17:36:25Z` → `2026-10-11T17:42:45Z` (UTC)
 - **Host:** Windows, Python 3.14.5, Docker Engine 29.6.2, Compose v5.3.1,
   Node v26.7.0, npm 11.19.0
 
@@ -46,11 +45,17 @@ values in `.env`, and Compose configuration is validated only with `config -q`.
 | e2e_resilience | `uv run pytest tests/e2e/test_resilience.py -q` | passed | 9 passed |
 | e2e_console | `uv run pytest tests/e2e/test_console.py -q` | passed | 5 passed (real Chromium) |
 | compose_restore_default | default `up --build -d --wait` | passed | — |
-| tracked_secret_scan | `git ls-files` + pattern scan | passed | 77 tracked files, no secret material |
+| tracked_secret_scan | `git ls-files` + pattern scan | passed | 82 tracked files, no secret material |
 
 Totals from the report: **19 checks passed, 0 failed, 0 blocked; required
 checks OK.** That corresponds to 154 executed test cases
 (101 backend, 31 frontend, 22 real Docker/browser E2E).
+
+A prior run of the driver failed `compose_up_default` loudly with exit 1 because
+the Docker image build hit a transient `pip` read timeout against
+`files.pythonhosted.org`; the run exited non-zero rather than masking it. After
+the image cache was warmed, the re-run above passed cleanly. The driver never
+treats a masked pipeline or a retried failure as success.
 
 ## Real service recovery vs scripted agent inference
 
