@@ -1,14 +1,14 @@
-# Verification evidence (Milestone 6)
+# Verification evidence (Milestone 6 + adversarial repair)
 
 This document records the commands that were actually executed, the observed
-results, and the one explicit blocker. It contains no projected or estimated
+results, and the explicit blockers. It contains no projected or estimated
 counts: every number below is copied from the machine-readable report produced by
 the verification driver at `.hermes/evidence/verify/report.json` (logs alongside
 it under `.hermes/evidence/verify/logs/`).
 
-- **Source revision:** `35e1584f015352df39e11d881b245f2929adcffc`
+- **Source revision:** `436587b6654eb0bb115c8c2a7b33020245d5b95a`
   (`feat/incident-recovery`, clean working tree at run time)
-- **Report generated:** `2026-10-11T17:36:25Z` → `2026-10-11T17:42:45Z` (UTC)
+- **Report generated:** `2026-10-11T18:56:16Z` → `2026-10-11T19:04:22Z` (UTC)
 - **Host:** Windows, Python 3.14.5, Docker Engine 29.6.2, Compose v5.3.1,
   Node v26.7.0, npm 11.19.0
 
@@ -19,17 +19,20 @@ it under `.hermes/evidence/verify/logs/`).
 uv run python scripts/verify.py --docker --ui
 ```
 
-The driver exits non-zero if any *required* check fails or is blocked. It applies
-the test-only control override and the explicit scripted-investigation override
-for the Docker E2E phase and restores the default stack in a `finally` block even
-when a check fails. It never prints secrets: output is sanitized against the
-values in `.env`, and Compose configuration is validated only with `config -q`.
+The driver exits non-zero if any *required* check fails or is blocked. Required
+pytest and vitest checks are now gated: a zero-test, skipped-only, or
+failing/collection-error run is reported `failed`, never `passed`. The driver
+applies the test-only control override and the explicit scripted-investigation
+override for the Docker E2E phase and restores the default stack in a `finally`
+block even when a check fails. It never prints secrets: output is sanitized
+against the values in `.env`, and Compose configuration is validated only with
+`config -q`.
 
 ## Observed results
 
 | Check | Command | Result | Counts |
 | --- | --- | --- | --- |
-| backend_unit | `uv run pytest tests/unit -q` | passed | 38 passed |
+| backend_unit | `uv run pytest tests/unit -q` | passed | 69 passed |
 | frontend_install | `npm --prefix frontend ci` | passed | — |
 | frontend_unit | `npm --prefix frontend test -- --run` | passed | 31 passed |
 | frontend_build | `npm --prefix frontend run build` | passed | — |
@@ -37,7 +40,7 @@ values in `.env`, and Compose configuration is validated only with `config -q`.
 | compose_config_default | `docker compose -p incident-recovery -f compose.yaml config -q` | passed | — |
 | compose_config_overrides | `docker compose -p incident-recovery -f compose.yaml -f compose.test.yaml -f compose.investigation.yaml config -q` | passed | — |
 | compose_up_default | `docker compose -p incident-recovery -f compose.yaml up --build -d --wait` | passed | — |
-| backend_integration | `uv run pytest tests/integration -q` | passed | 63 passed |
+| backend_integration | `uv run pytest tests/integration -q` | passed | 69 passed |
 | compose_up_overrides | override `up --build -d --wait` | passed | — |
 | e2e_deployment | `uv run pytest tests/e2e/test_deployment.py -q` | passed | 4 passed |
 | e2e_recovery | `uv run pytest tests/e2e/test_recovery.py -q` | passed | 3 passed |
@@ -45,17 +48,43 @@ values in `.env`, and Compose configuration is validated only with `config -q`.
 | e2e_resilience | `uv run pytest tests/e2e/test_resilience.py -q` | passed | 9 passed |
 | e2e_console | `uv run pytest tests/e2e/test_console.py -q` | passed | 5 passed (real Chromium) |
 | compose_restore_default | default `up --build -d --wait` | passed | — |
-| tracked_secret_scan | `git ls-files` + pattern scan | passed | 82 tracked files, no secret material |
+| tracked_secret_scan | `git ls-files` + pattern scan | passed | 85 tracked files, no secret material |
 
-Totals from the report: **19 checks passed, 0 failed, 0 blocked; required
-checks OK.** That corresponds to 154 executed test cases
-(101 backend, 31 frontend, 22 real Docker/browser E2E).
+Totals from the report: **19 checks passed, 0 failed, 0 blocked; required checks
+OK.** That corresponds to 191 executed test cases
+(138 backend, 31 frontend, 22 real Docker/browser E2E).
 
-A prior run of the driver failed `compose_up_default` loudly with exit 1 because
-the Docker image build hit a transient `pip` read timeout against
-`files.pythonhosted.org`; the run exited non-zero rather than masking it. After
-the image cache was warmed, the re-run above passed cleanly. The driver never
-treats a masked pipeline or a retried failure as success.
+## Adversarial repair
+
+The final adversarial repair closed seven independently reproduced defects. Each
+one has a RED→GREEN regression test; the full findings, dispositions, and the
+observed RED/GREEN outputs are in `docs/adversarial-repair.md`. In summary:
+
+- **BLOCKER** — the gateway switch now refreshes the authoritative admission time
+  with `clock_timestamp()` after the row lock, so an approval that expires during
+  a lock wait cannot be applied (`test_switch_expiry_after_lock_wait_cannot_mutate`).
+- **MAJOR** — an exact durable operation is replayed/reconciled before any
+  fresh-admission check, closing the crash window between the durable switch and
+  `record_execution` (`test_switch_replays_exact_durable_operation_after_expiry`,
+  `test_executor_reconciles_durable_operation_on_resume`,
+  `test_executor_reconciles_when_switch_response_rejected`).
+- **MAJOR** — `_bounded_json` is now guaranteed byte-bounded for nested lists,
+  single huge entries, multibyte values, and tiny budgets
+  (`test_tools.py` bound tests).
+- **MAJOR** — secret-shaped keys and values are recursively redacted at every
+  evidence/trace persistence boundary (`test_tools.py` redaction tests and
+  `test_repository_redacts_nested_secrets_at_persistence`).
+- **MAJOR** — verification uses strict elapsed semantics and bounds each probe by
+  the remaining deadline, never resolving beyond the deadline
+  (`test_slow_probe_cannot_resolve_after_deadline`,
+  `test_slow_real_client_never_resolves_beyond_deadline`).
+- **MAJOR** — the functional check requires the health response's authoritative
+  `X-Deployment-Revision`/`X-Deployment-Generation` to match the intended
+  revision and snapshot generation, failing closed on missing/malformed identity
+  (`test_probe_rejects_health_identity_revision_mismatch` and four siblings).
+- **MINOR** — the verify driver rejects zero-test, skipped-only, and
+  failing/collection-error test runs for required pytest and vitest suites
+  (`test_verify_runner.py`).
 
 ## Real service recovery vs scripted agent inference
 
@@ -88,35 +117,13 @@ requires a separately configured OpenAI-compatible provider; it performs a real
 provider call and asserts the recorded adapter identity is `openai-compatible:*`.
 It deliberately does not read or reuse any coding-CLI credential.
 
-## Adversarial resilience coverage
-
-`tests/e2e/test_resilience.py` (real containers) and
-`tests/integration/test_resilience.py` (real PostgreSQL, no containers) cover:
-duplicate alerts and duplicate approvals collapsing to one logical incident /
-operation; a worker restart preserving the investigation epoch, tool-call count,
-and deadline; a competing fault injection refused while a recovery owns the
-deployment; an approval that expired during recovery admission refused at the
-authoritative internal switch; the public gateway exposing no switch and the
-internal switch requiring the internal token; no container mounted with the
-Docker socket and the executor publishing no host port; an unsuccessful
-(stale-generation) recovery becoming `recovery_failed` rather than resolving;
-oversized/poisoned observations bounded and redacted; foreign and stale-epoch
-evidence escalating without a proposal; malformed provider output escalating; and
-a stale recovery lease being unable to finalize verification. Runtime secrets are
-asserted absent from persisted evidence, events, and gateway logs.
-
-Fixing the oversized-observation gap required a code change: `_bounded_json` in
-`src/incident_recovery/tools.py` now deterministically shrinks a hostile payload
-below `MAX_RESPONSE_BYTES` (previously a single huge field or a large log list
-could exceed the 16 KiB evidence cap and escalate as a tool failure).
-
 ## Explicit non-claims
 
 - This is a **local Docker demo**, not a production system, and is not production
   ready.
 - **Exactly-once physical side effects are not claimed.** Recovery is an
-  idempotent desired-state change plus operation-id reconciliation; a crash can
-  resume the same persisted operation, but no physical exactly-once guarantee is
-  asserted.
+  idempotent desired-state change plus exact operation-id reconciliation; a crash
+  can resume the same persisted operation, but no physical exactly-once guarantee
+  is asserted.
 - The scripted adapter is not live inference, and no scripted result is reported
   as live evidence.
