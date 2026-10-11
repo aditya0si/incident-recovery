@@ -1,0 +1,11 @@
+{
+  "manifest_version": 1,
+  "component": "tenant-api-platform",
+  "source_sha": "a6f715aac1d4e46b2ef30e12fb42d4719672f7f5",
+  "short_sha": "a6f715a",
+  "archive": ".hermes/tenant-api-a6f715a.tar",
+  "archive_sha256": "3837fb8bf2bf06080af068a75a6cfd2e22d1f4e15e5b104b73dacd015c5ca48c",
+  "archive_bytes": 1525760,
+  "origin": "parent-supplied pinned git archive; a metadata input, not delegate-produced evidence",
+  "note": "This repo does not read or verify the original sibling checkout. Provenance is bound to the parent-supplied archive hash and the git commit id embedded in the archive pax header. It is not a claim that the parent verified anything."
+}

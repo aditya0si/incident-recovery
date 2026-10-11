@@ -1,0 +1,185 @@
+# Isolated staging stack for the real tenant-api-platform workload.
+#
+# This is deliberately NOT the upstream docker-compose.yml. That file uses fixed
+# `container_name: tap-*` entries, publishes 5432/6379/8080/9090 on the host, and
+# runs on development credentials — reusing it would collide with the running
+# incident-recovery demo and share a database. This stack is its own Compose
+# project (`incident-recovery-staging`) with project-scoped networks/volumes,
+# loopback-only host bindings, dedicated PostgreSQL/Redis, and generated
+# credentials supplied through the gitignored `staging/.env`.
+#
+# Usage:
+#   python scripts/staging_env.py
+#   python scripts/staging_source.py
+#   docker compose -f staging/compose.yaml --env-file staging/.env \
+#     -p incident-recovery-staging config -q
+#   docker compose -f staging/compose.yaml --env-file staging/.env \
+#     -p incident-recovery-staging up --build -d --wait
+
+name: incident-recovery-staging
+
+x-tenant-build: &tenant-build
+  build:
+    context: ./vendor/tenant-api-platform
+    dockerfile: Dockerfile
+  image: incident-recovery-staging-tenant-api:${STAGING_SOURCE_SHORT_SHA:-a6f715a}
+
+x-api-ready: &api-ready
+  test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8080/readyz || exit 1"]
+  interval: 5s
+  timeout: 3s
+  retries: 30
+  start_period: 10s
+
+x-worker-ready: &worker-ready
+  test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:9090/readyz || exit 1"]
+  interval: 5s
+  timeout: 3s
+  retries: 30
+  start_period: 10s
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${STAGING_OWNER_USER}
+      POSTGRES_PASSWORD: ${STAGING_OWNER_PASSWORD}
+      POSTGRES_DB: ${STAGING_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - staging_net
+    # No host port by default: reachable only over staging_net.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${STAGING_OWNER_USER} -d ${STAGING_DB}"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+      start_period: 5s
+
+  redis:
+    image: redis:7-alpine
+    # requirepass is supplied through the container environment, never on the
+    # command line, so the value does not appear in `docker inspect` args.
+    command:
+      - sh
+      - -c
+      - exec redis-server --appendonly yes --requirepass "$$STAGING_REDIS_PASSWORD"
+    environment:
+      STAGING_REDIS_PASSWORD: ${STAGING_REDIS_PASSWORD}
+    volumes:
+      - redisdata:/data
+    networks:
+      - staging_net
+    # No host port by default: reachable only over staging_net.
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "redis-cli --no-auth-warning -a \"$$STAGING_REDIS_PASSWORD\" ping | grep -q PONG",
+        ]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+      start_period: 5s
+
+  # Applies the pinned migrations once, as the owner role, then exits.
+  migrate:
+    <<: *tenant-build
+    entrypoint: ["/bin/migrate", "up"]
+    environment:
+      MIGRATE_DATABASE_URL: postgres://${STAGING_OWNER_USER}:${STAGING_OWNER_PASSWORD}@postgres:5432/${STAGING_DB}?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - staging_net
+    restart: "no"
+
+  # Migration 0001 creates app_rw with a fixed development password. The API and
+  # worker refuse to start on a privileged role (db.AssertUnprivilegedRole), so
+  # the application must connect as app_rw — with a generated password, not the
+  # development default. This one-shot rotates it after migrations, feeding the
+  # value over stdin so it never appears in a process argument list.
+  app-role-provision:
+    image: postgres:16-alpine
+    environment:
+      PGHOST: postgres
+      PGUSER: ${STAGING_OWNER_USER}
+      PGPASSWORD: ${STAGING_OWNER_PASSWORD}
+      PGDATABASE: ${STAGING_DB}
+      APP_DB_PASSWORD: ${STAGING_APP_PASSWORD}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        printf "ALTER ROLE app_rw WITH LOGIN PASSWORD '%s';\n" "$$APP_DB_PASSWORD" | psql -v ON_ERROR_STOP=1 -f -
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - staging_net
+    restart: "no"
+
+  api:
+    <<: *tenant-build
+    entrypoint: ["/bin/api"]
+    environment:
+      APP_ENV: staging
+      PORT: "8080"
+      DATABASE_URL: postgres://app_rw:${STAGING_APP_PASSWORD}@postgres:5432/${STAGING_DB}?sslmode=disable
+      REDIS_URL: redis://:${STAGING_REDIS_PASSWORD}@redis:6379/0
+      JWT_SECRET: ${STAGING_JWT_SECRET}
+      LOG_LEVEL: info
+      # Trust no proxy: every request is attributed to its socket address, so the
+      # unauthenticated rate limits cannot be bypassed with a header.
+      TRUSTED_PROXY_CIDRS: ""
+    ports:
+      - "127.0.0.1:${STAGING_API_PORT}:8080"
+    networks:
+      - staging_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      app-role-provision:
+        condition: service_completed_successfully
+    healthcheck: *api-ready
+
+  # Webhook outbox worker; same image as the API with a different entrypoint.
+  worker:
+    <<: *tenant-build
+    entrypoint: ["/bin/worker"]
+    environment:
+      APP_ENV: staging
+      DATABASE_URL: postgres://app_rw:${STAGING_APP_PASSWORD}@postgres:5432/${STAGING_DB}?sslmode=disable
+      WORKER_METRICS_PORT: "9090"
+      WORKER_BATCH_SIZE: "10"
+      WORKER_INTERVAL: 1s
+      LOG_LEVEL: info
+    ports:
+      - "127.0.0.1:${STAGING_WORKER_PORT}:9090"
+    networks:
+      - staging_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      app-role-provision:
+        condition: service_completed_successfully
+    healthcheck: *worker-ready
+    restart: unless-stopped
+
+networks:
+  staging_net:
+    name: incident-recovery-staging-net
+    driver: bridge
+
+volumes:
+  pgdata:
+    name: incident-recovery-staging-pgdata
+  redisdata:
+    name: incident-recovery-staging-redisdata

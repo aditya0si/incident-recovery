@@ -23,3 +23,8 @@ frontend/test-results/
 # Editor/OS
 .DS_Store
 Thumbs.db
+
+# Staging isolation artifacts (generated; never committed)
+staging/.env
+staging/vendor/
+
