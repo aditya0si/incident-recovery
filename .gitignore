@@ -1,0 +1,19 @@
+# Local runtime secrets (generated, never committed)
+.env
+
+# Agent orchestration evidence and briefs
+.hermes/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+
+# Editor/OS
+.DS_Store
+Thumbs.db

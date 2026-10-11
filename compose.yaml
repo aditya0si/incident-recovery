@@ -1,0 +1,108 @@
+name: incident-recovery
+
+x-app: &app
+  build:
+    context: .
+  image: incident-recovery-app:local
+
+x-livez-check: &livez-check
+  test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/livez')"]
+  interval: 3s
+  timeout: 3s
+  retries: 40
+  start_period: 5s
+
+x-healthz-check: &healthz-check
+  test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+  interval: 3s
+  timeout: 3s
+  retries: 40
+  start_period: 5s
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - internal_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+      start_period: 5s
+
+  demo-healthy-v1:
+    <<: *app
+    command: ["python", "-m", "incident_recovery.demo"]
+    environment:
+      DEMO_REVISION: healthy-v1
+      PORT: "8000"
+    networks:
+      - demo_net
+    healthcheck: *livez-check
+
+  demo-broken-v2:
+    <<: *app
+    command: ["python", "-m", "incident_recovery.demo"]
+    environment:
+      DEMO_REVISION: broken-v2
+      PORT: "8000"
+    networks:
+      - demo_net
+    healthcheck: *livez-check
+
+  gateway:
+    <<: *app
+    command: ["python", "-m", "incident_recovery.gateway"]
+    environment:
+      GATEWAY_ROLE: proxy
+      PORT: "8000"
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    ports:
+      - "127.0.0.1:${GATEWAY_PORT}:8000"
+    networks:
+      - demo_net
+      - internal_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      demo-healthy-v1:
+        condition: service_healthy
+      demo-broken-v2:
+        condition: service_healthy
+    healthcheck: *healthz-check
+
+  gateway-control:
+    <<: *app
+    command: ["python", "-m", "incident_recovery.gateway"]
+    environment:
+      GATEWAY_ROLE: control
+      PORT: "8000"
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN}
+    ports:
+      - "127.0.0.1:${CONTROL_PORT}:8000"
+    networks:
+      - internal_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck: *healthz-check
+
+networks:
+  demo_net:
+    driver: bridge
+  internal_net:
+    driver: bridge
+
+volumes:
+  pgdata:
+    name: incident-recovery-pgdata
