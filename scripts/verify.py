@@ -574,6 +574,35 @@ class Verifier:
         )
         if not self.args.live:
             return {"configured": configured, "status": "not_requested", "reason": "--live not passed"}
+
+        # Task 2 gate: the Go non-coding runtime remains ineligible until reviewed,
+        # scoped provider eligibility is recorded.  This blocks the live call even
+        # when credentials are present; it is never reported as a success.
+        from incident_recovery.provider_policy import (
+            OFFICIAL_DOC_URL,
+            go_runtime_eligible,
+            load_go_runtime_eligibility,
+        )
+
+        eligibility = load_go_runtime_eligibility(self.env)
+        if not go_runtime_eligible(eligibility):
+            self._blocked(
+                "live_model_investigation",
+                "staging runtime provider eligibility blocked: official Go documentation "
+                f"({OFFICIAL_DOC_URL}) does not explicitly approve this non-coding runtime "
+                "workload; reviewed scoped eligibility is required. No live call made.",
+                category="optional",
+            )
+            return {
+                "configured": configured,
+                "status": "blocked",
+                "reason": "provider_eligibility_blocked",
+                "eligibility": {
+                    "status": eligibility.status,
+                    "source": eligibility.source,
+                    "scope": eligibility.scope,
+                },
+            }
         if not configured:
             self._blocked(
                 "live_model_investigation",

@@ -103,6 +103,33 @@ Machine-readable results: `.hermes/evidence/staging-task1/results.json`
 (25/25 checks passed). Sanitized logs and provenance artifacts are in the same
 directory.
 
+## Task 2 provider gate (blocked, no live calls)
+
+Runtime provider **eligibility remains BLOCKED**. The official OpenCode Go
+documentation (`https://opencode.ai/docs/go/`, section *Where can I use it*)
+describes Go as designed for OpenCode and coding agents issuing similar
+coding-agent traffic; it does **not** explicitly approve a non-coding runtime
+incident-investigation workload. The scope of this application is therefore
+unresolved, recorded as blocked rather than claimed eligible or prohibited.
+
+- `src/incident_recovery/provider_policy.py` fails closed: a blocked gate
+  prevents **any** transport call, and no self-asserted boolean can enable it.
+  Enabling the runtime requires reviewed, scoped eligibility evidence supplied
+  through secure orchestrator configuration; a user account authorization is not
+  provider permission.
+- The bounded adapter sends the truthful `incident-recovery-staging` user agent
+  and a stable incident-derived `x-opencode-session` (same session across turns
+  and retries, different across incidents). It never spoofs another client.
+- Paid calls are bounded by a staging-specific durable ledger: at most 12
+  investigations plus one smoke call, concurrency 1, 8 provider turns per
+  incident, 4096 output tokens per call, 20000 input characters per call and
+  12 tools / 120 seconds; attempts (including retries) are counted separately
+  and cannot exceed the paid allowance. Unknown provider usage/cost is recorded
+  as unknown, never zero.
+- **No live provider call was made in Task 2.** The live gate is reported
+  explicitly blocked; this is not a live provider compatibility claim. Coding
+  through OpenCode remains allowed separately.
+
 ## Existing demo
 
 The original `incident-recovery` demo stack was left running and unmodified; its
