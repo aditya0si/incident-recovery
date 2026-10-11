@@ -186,14 +186,81 @@ ALTER TABLE incident_events ADD CONSTRAINT incident_events_kind_valid CHECK (kin
     'recovery_executed','recovery_verified','recovery_failed','escalated','fault_injected'));
 """
 
+INVESTIGATION_SCHEMA_SQL = """
+-- Migration 4: bounded, evidence-backed investigation.
+--
+-- One investigation *run* per incident epoch persists the adapter identity, the
+-- server-enforced tool-call and wall-clock budget, and a terminal run state, so a
+-- worker restart resumes the same epoch instead of resetting limits.  Logical
+-- step traces are unique per (incident, epoch, step_index) and immutable, so a
+-- restarted worker can never duplicate a trace.  Investigation evidence carries
+-- the epoch it was observed in; the proposal gate requires evidence that belongs
+-- to the incident's current epoch.
+
+ALTER TABLE incident_evidence ADD COLUMN IF NOT EXISTS epoch INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS incident_evidence_epoch_idx
+    ON incident_evidence (incident_id, epoch, observed_at, id);
+
+CREATE TABLE IF NOT EXISTS investigation_runs (
+    incident_id  UUID NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
+    epoch        INTEGER NOT NULL,
+    adapter      TEXT NOT NULL,
+    state        TEXT NOT NULL DEFAULT 'running',
+    tool_calls   INTEGER NOT NULL DEFAULT 0,
+    started_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deadline_at  TIMESTAMPTZ NOT NULL,
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_error   TEXT,
+    PRIMARY KEY (incident_id, epoch),
+    CONSTRAINT investigation_runs_state_valid CHECK (state IN ('running','decided','escalated','failed')),
+    CONSTRAINT investigation_runs_tool_calls_bounds CHECK (tool_calls >= 0 AND tool_calls <= 12)
+);
+
+CREATE TABLE IF NOT EXISTS investigation_steps (
+    id          BIGSERIAL PRIMARY KEY,
+    incident_id UUID NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
+    epoch       INTEGER NOT NULL,
+    step_index  INTEGER NOT NULL,
+    kind        TEXT NOT NULL,
+    payload     JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT investigation_steps_kind_valid CHECK (kind IN (
+        'run_started','tool_request','tool_result','diagnosis','decision','escalation')),
+    CONSTRAINT investigation_steps_payload_size CHECK (octet_length(payload::text) <= 16384),
+    CONSTRAINT investigation_steps_unique UNIQUE (incident_id, epoch, step_index)
+);
+CREATE INDEX IF NOT EXISTS investigation_steps_epoch_idx
+    ON investigation_steps (incident_id, epoch, step_index);
+
+DROP RULE IF EXISTS investigation_steps_no_update ON investigation_steps;
+CREATE RULE investigation_steps_no_update AS ON UPDATE TO investigation_steps DO INSTEAD NOTHING;
+
+-- Add the distinct investigation event kinds.
+ALTER TABLE incident_events DROP CONSTRAINT IF EXISTS incident_events_kind_valid;
+ALTER TABLE incident_events ADD CONSTRAINT incident_events_kind_valid CHECK (kind IN (
+    'detected','state_changed','evidence_recorded','proposal_created',
+    'approval_requested','approved','rejected','recovery_started',
+    'recovery_executed','recovery_verified','recovery_failed','escalated',
+    'fault_injected','investigation_started','diagnosis'));
+"""
+
+# Migration 5 removes the investigation-steps delete rule added by an earlier
+# draft of migration 4: a DO INSTEAD NOTHING delete rule breaks the parent
+# incident cascade.  Step traces are still append-only (no UPDATE rule and no
+# repository delete path); evidence immutability remains database-enforced.
+INVESTIGATION_STEPS_CASCADE_FIX_SQL = """
+DROP RULE IF EXISTS investigation_steps_no_delete ON investigation_steps;
+"""
+
 MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, DEPLOYMENT_SCHEMA_SQL),
     (2, INCIDENT_SCHEMA_SQL),
     (3, RECOVERY_SCHEMA_SQL),
+    (4, INVESTIGATION_SCHEMA_SQL),
+    (5, INVESTIGATION_STEPS_CASCADE_FIX_SQL),
 )
 
 _ADVISORY_LOCK_KEY = 7762002
-
 
 async def _init_connection(conn: asyncpg.Connection) -> None:
     for type_name in ("json", "jsonb"):

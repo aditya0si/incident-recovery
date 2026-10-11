@@ -154,6 +154,19 @@ services:
       WORKER_ID: worker-1
       WORKER_POLL_INTERVAL: "1.0"
       RECOVERY_LEASE_SECONDS: "120"
+      # Bounded investigation. The runtime model is configured separately from any
+      # coding CLI credential. With no credentials the adapter fails closed and
+      # escalates rather than substituting a script; `INVESTIGATION_ADAPTER=scripted`
+      # is an explicit opt-in used only by tests / the labeled demo override.
+      INVESTIGATION_ADAPTER: ${INVESTIGATION_ADAPTER:-}
+      MODEL_BASE_URL: ${MODEL_BASE_URL:-}
+      MODEL_NAME: ${MODEL_NAME:-}
+      MODEL_API_KEY: ${MODEL_API_KEY:-}
+      MODEL_TIMEOUT: ${MODEL_TIMEOUT:-20}
+      MODEL_MAX_RETRIES: ${MODEL_MAX_RETRIES:-2}
+      INVESTIGATION_MAX_TOOL_CALLS: ${INVESTIGATION_MAX_TOOL_CALLS:-12}
+      INVESTIGATION_MAX_SECONDS: ${INVESTIGATION_MAX_SECONDS:-120}
+      INVESTIGATION_LEASE_SECONDS: ${INVESTIGATION_LEASE_SECONDS:-180}
     networks:
       - internal_net
     depends_on:

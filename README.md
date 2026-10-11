@@ -5,11 +5,12 @@ switches real HTTP traffic between a predefined healthy and broken version, with
 a durable incident workflow, operator control surface, and approval-gated,
 independently verified rollback.
 
-**Milestones 1–3.** This repository implements the real demo deployment slice
-(Task 1), the durable incident workflow plus operator API (Task 2), and
+**Milestones 1–4.** This repository implements the real demo deployment slice
+(Task 1), the durable incident workflow plus operator API (Task 2),
 approval-gated rollback with durable recovery and sustained functional
-verification (Task 3). The bounded model investigation agent (Task 4) and the
-console (Task 5) are later milestones and are **not** implemented here.
+verification (Task 3), and the bounded, evidence-backed investigation agent
+(Task 4). The console (Task 5) is a later milestone and is **not** implemented
+here.
 
 ## Architecture
 
@@ -37,9 +38,10 @@ console (Task 5) are later milestones and are **not** implemented here.
 - `executor`: restricted internal executor. Accepts only a persisted operation
   id over an authenticated channel, exposes **no** host port, and receives
   **no** Docker socket (revision switching needs no Docker power).
-- `worker`: durable recovery worker. Claims leased incidents, executes the
-  persisted operation through the executor, and runs sustained functional
-  verification through the public gateway.
+- `worker`: durable recovery worker. Claims leased incidents, runs the bounded
+  investigation stage for `detected`/`investigating` incidents, executes the
+  persisted recovery operation through the executor, and runs sustained
+  functional verification through the public gateway.
 - `demo-healthy-v1` / `demo-broken-v2`: predefined workloads on `demo_net`.
 - `postgres`: source of truth for deployment state and the durable incident
   workflow (incidents, immutable evidence, append-only events, proposals,
@@ -98,6 +100,45 @@ console (Task 5) are later milestones and are **not** implemented here.
   consecutive times, two seconds apart, within 30 seconds**. Failures reset the
   streak; an expired deadline or functional/ambiguous failure becomes
   `recovery_failed`. An executor `200` alone never resolves.
+
+### Task 4 bounded investigation agent
+
+- **Bounded read-only tools.** The agent can call exactly four tools: `health`,
+  `logs`, `metrics`, and `deployments`. `ToolRequest` forbids every field except
+  the tool name and an optional bounded `lines` count, so a model can never
+  supply a URL, path, container id, shell command, or arbitrary destination.
+  `health`/`logs`/`metrics` read the fixed gateway paths; `deployments` reads the
+  authoritative PostgreSQL deployment state and history.
+- **Real, not fabricated, observations.** The demo workload records an in-memory
+  structured log ring buffer (`/logs`) and actual runtime request counters
+  (`/metrics`), exposed through the stable gateway (`/api/logs`, `/api/metrics`).
+  Log and metric text is treated as untrusted data, redacted for secret-shaped
+  values, and size-limited before it is persisted as evidence.
+- **Durable budget and traces.** One investigation *run* per incident epoch
+  persists the adapter identity, the tool-call count, and the wall-clock
+  deadline; logical step traces are unique per `(incident, epoch, step_index)`.
+  A worker restart resumes the same epoch with the same budget and cannot
+  duplicate a trace. Server-enforced maxima are **12 tool calls** and **120
+  seconds**; per-provider deadlines and bounded retries count toward the budget.
+- **Deterministic proposal gate.** The model's diagnosis is never trusted as an
+  authorization. A proposal is only created when the cited evidence belongs to
+  the incident's current epoch, shows observed current functional failure, the
+  deployment evidence matches the authoritative revision/generation, and the
+  target is the recorded known-good predecessor `healthy-v1`. Unsupported
+  conclusions, foreign/nonexistent/stale evidence, prompt injection in logs,
+  malformed provider JSON, provider unavailability, and budget exhaustion all
+  **escalate** instead of recovering. There is no proposal-injection endpoint.
+- **Fail-closed runtime model.** The live adapter is an OpenAI-compatible
+  chat-completions client configured only through `MODEL_BASE_URL`,
+  `MODEL_NAME`, and `MODEL_API_KEY` (separate from any coding-CLI credential).
+  When credentials are absent the adapter is `missing-credentials` and the
+  investigation escalates; it never silently substitutes a script. The
+  deterministic `scripted:demo` adapter is enabled only by the explicit
+  `INVESTIGATION_ADAPTER=scripted` opt-in (tests / the labeled demo override) and
+  every run records its adapter identity.
+- **State flow.** The worker moves `detected` → `investigating` → either
+  `awaiting_approval` (a gated, evidence-linked proposal) or `escalated`; the
+  existing Task 3 approval/recovery path then proceeds unchanged.
 
 ### Security model
 
@@ -193,10 +234,24 @@ uv run pytest tests/e2e/test_recovery.py -v     # approved rollback, rejection, 
 docker compose -p incident-recovery up --build -d --wait
 ```
 
+The scripted-investigation E2E suite needs the worker to use the explicitly
+labeled `scripted:demo` adapter, which is enabled only by the opt-in override
+(never the default stack):
+
+```bash
+docker compose -p incident-recovery -f compose.yaml -f compose.investigation.yaml up --build -d --wait
+uv run pytest tests/e2e/test_investigation.py -v   # alert -> real tools -> proposal -> approve -> rollback -> verify
+docker compose -p incident-recovery up --build -d --wait   # restore default
+```
+
 E2E tests **fail loudly** when prerequisites are missing; they never skip and
 silently pass. `test_recovery.py` performs a real approved rollback through the
 live API and asserts sustained checks; it briefly stops and restarts the real
 `worker` container to prove recovery resumes from persisted state.
+`test_investigation.py` drives a real alert through the real worker/gateway
+health/logs/metrics/deployments tools to a gated proposal, then through the real
+approval and sustained-verification path. Scripted runs are recorded with the
+`scripted:demo` adapter identity.
 
 ## Operator API demonstration
 
@@ -227,12 +282,35 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18080/api/work   # 500
 A write without a token returns 401; a write with an untrusted `Origin` returns
 403 even with a valid token.
 
-### Approval-gated recovery demonstration
+### Investigation and approval-gated recovery demonstration
 
-Task 3 binds approval to a proposal digest; the bounded investigation agent that
-*creates* proposals automatically is Task 4. Until then, a proposal can be
-inserted through the repository (as the tests do), after which the operator
-approves or rejects it over the API:
+An alert starts a real worker investigation. With the default stack and no
+runtime model credentials, the investigation fails closed and escalates:
+
+```bash
+curl -s -X POST http://127.0.0.1:18082/alerts \
+  -H "Authorization: Bearer $OPERATOR_TOKEN" -H "Content-Type: application/json" \
+  -d '{"dedupe_key":"demo-2","service_id":"demo-api","summary":"functional failure"}'
+# shortly after: state == "escalated" (events: investigation_started, escalated)
+```
+
+With a live provider configured (`MODEL_BASE_URL` / `MODEL_NAME` / `MODEL_API_KEY`)
+the worker investigates with real tools and, when the gate passes, records an
+evidence-linked proposal and moves the incident to `awaiting_approval`. To run the
+deterministic, explicitly labeled scripted path without a provider, use the opt-in
+override:
+
+```bash
+docker compose -p incident-recovery -f compose.yaml -f compose.investigation.yaml up --build -d --wait
+curl -s -X POST http://127.0.0.1:18082/alerts \
+  -H "Authorization: Bearer $OPERATOR_TOKEN" -H "Content-Type: application/json" \
+  -d '{"dedupe_key":"demo-3","service_id":"demo-api","summary":"functional failure"}'
+# GET /incidents/{id}: state "awaiting_approval" with a proposal whose evidence_ids
+# reference tool:health and tool:deployments observations (adapter scripted:demo)
+docker compose -p incident-recovery up --build -d --wait   # restore default
+```
+
+The operator then approves the exact proposal digest (or rejects it):
 
 ```bash
 # approve the exact proposal digest (actor recorded; five-minute TTL)
@@ -261,10 +339,14 @@ proposal/approval/operation/verification needed by the future console.
   (see `docs/security.md`); container restart is deferred to a later milestone.
 - The broken revision is a predefined demo fault; it is not a production
   control surface.
-- Task 3 gates rollback on exact approval and verifies sustained functional
-  recovery. It does **not** yet run bounded model investigation (Task 4) or
-  provide the console (Task 5); proposals are created by repository fixtures or
-  tests until Task 4.
+- Task 4 runs bounded, evidence-backed investigation with real observations and a
+  deterministic proposal gate. It does **not** provide the console (Task 5); the
+  operator inspects incidents over `GET /incidents/{id}` until then.
+- Live-model investigation is **blocked** without a separately configured
+  OpenAI-compatible runtime model. The default stack therefore escalates
+  investigations (`adapter=missing-credentials`) rather than fabricating a
+  scripted success. Scripted investigation requires the explicit opt-in override
+  and is always labeled `scripted:demo`.
 - The internal token and operator token are shared secrets for this local demo;
   the internal switch and executor are reachable only over the Compose internal
   network and expose no host port.

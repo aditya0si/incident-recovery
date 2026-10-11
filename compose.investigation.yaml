@@ -1,0 +1,18 @@
+# Opt-in, explicitly labeled scripted-investigation override (tests / local demo).
+#
+# The default stack requires a real OpenAI-compatible runtime model and escalates
+# when credentials are absent.  This override enables the deterministic,
+# explicitly labeled `scripted:demo` adapter so the real alert → tool
+# observations → proposal → approval → rollback path can be demonstrated and
+# tested end to end without a live provider.  It is NEVER part of the default
+# stack, and scripted runs are recorded with the `scripted:demo` adapter identity.
+#
+# Usage:
+#   docker compose -p incident-recovery -f compose.yaml -f compose.investigation.yaml up --build -d --wait
+#   uv run pytest tests/e2e/test_investigation.py -v
+#   docker compose -p incident-recovery up --build -d --wait   # restore default
+
+services:
+  worker:
+    environment:
+      INVESTIGATION_ADAPTER: scripted

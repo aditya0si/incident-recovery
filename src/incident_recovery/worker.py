@@ -52,6 +52,10 @@ class ExecutorClient(Protocol):
     async def execute(self, operation_id: UUID): ...
 
 
+class Investigator(Protocol):
+    async def investigate(self, incident: Incident): ...
+
+
 class HttpExecutorClient:
     """Calls the authenticated internal executor over the internal network."""
 
@@ -86,6 +90,8 @@ class RecoveryWorker:
         worker_id: str,
         *,
         lease_seconds: int = 120,
+        investigator: Optional[Investigator] = None,
+        investigation_lease_seconds: int = 180,
         clock=utcnow,
         poll_interval: float = 1.0,
     ) -> None:
@@ -94,6 +100,8 @@ class RecoveryWorker:
         self._verifier = verifier
         self._worker_id = worker_id
         self._lease_seconds = lease_seconds
+        self._investigator = investigator
+        self._investigation_lease_seconds = investigation_lease_seconds
         self._clock = clock
         self._poll_interval = poll_interval
 
@@ -101,12 +109,29 @@ class RecoveryWorker:
         incident = await self._repo.claim_next_recovery(
             self._worker_id, lease_seconds=self._lease_seconds, now=self._clock()
         )
-        if incident is None:
+        if incident is not None:
+            try:
+                await self._process(incident)
+            except LeaseLost:
+                # Another owner has taken over; leave the incident to them.
+                return True
+            return True
+
+        if self._investigator is None:
+            return False
+
+        # The investigation stage runs only when no recovery is pending, so an
+        # approved recovery always takes precedence over new investigations.
+        detected = await self._repo.claim_next_investigation(
+            self._worker_id,
+            lease_seconds=self._investigation_lease_seconds,
+            now=self._clock(),
+        )
+        if detected is None:
             return False
         try:
-            await self._process(incident)
+            await self._investigator.investigate(detected)
         except LeaseLost:
-            # Another owner has taken over; leave the incident to them.
             return True
         return True
 
@@ -237,8 +262,28 @@ async def _serve() -> None:
     executor = HttpExecutorClient(
         os.environ.get("EXECUTOR_URL", "http://executor:8000"), internal_token
     )
-    verifier, client = build_verifier(
-        os.environ.get("GATEWAY_URL", "http://gateway:8000")
+    gateway_url = os.environ.get("GATEWAY_URL", "http://gateway:8000")
+    verifier, client = build_verifier(gateway_url)
+
+    from .agent import InvestigationAgent
+    from .model_adapter import build_adapter_from_env
+    from .tools import ToolRunner
+
+    tools = ToolRunner(repo, gateway_url)
+    adapter = build_adapter_from_env()
+    investigator = InvestigationAgent(
+        repo,
+        tools,
+        adapter,
+        os.environ.get("WORKER_ID", "worker-1"),
+        max_tool_calls=int(os.environ.get("INVESTIGATION_MAX_TOOL_CALLS", "12")),
+        max_seconds=float(os.environ.get("INVESTIGATION_MAX_SECONDS", "120")),
+        provider_timeout=float(os.environ.get("MODEL_TIMEOUT", "20")),
+        lease_seconds=int(os.environ.get("INVESTIGATION_LEASE_SECONDS", "180")),
+    )
+    print(
+        f"worker investigation adapter identity: {adapter.identity}",
+        flush=True,
     )
     worker = RecoveryWorker(
         repo,
@@ -246,12 +291,17 @@ async def _serve() -> None:
         verifier,
         os.environ.get("WORKER_ID", "worker-1"),
         lease_seconds=int(os.environ.get("RECOVERY_LEASE_SECONDS", "120")),
+        investigator=investigator,
+        investigation_lease_seconds=int(
+            os.environ.get("INVESTIGATION_LEASE_SECONDS", "180")
+        ),
         poll_interval=float(os.environ.get("WORKER_POLL_INTERVAL", "1.0")),
     )
     try:
         await worker.run_forever()
     finally:
         await client.aclose()
+        await investigator.aclose()
 
 
 def main() -> None:

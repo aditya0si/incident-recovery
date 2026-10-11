@@ -1,4 +1,4 @@
-# Security model and trust boundaries (Milestones 1–3)
+# Security model and trust boundaries (Milestones 1–4)
 
 ## Network and credential boundaries
 
@@ -73,3 +73,36 @@ Resolution is decided by independent sustained functional verification through
 the public gateway (matching revision + functional health, three consecutive
 successes two seconds apart within 30 seconds). An executor success response
 alone never resolves an incident.
+
+## Investigation trust boundary (Milestone 4)
+
+The investigation agent is deliberately the least-privileged component:
+
+- **Read-only, fixed tools.** Exactly four tools exist (`health`, `logs`,
+  `metrics`, `deployments`). `ToolRequest` uses `extra="forbid"` and accepts only
+  a tool name plus an optional bounded `lines` count, so model output can never
+  carry a URL, filesystem path, container identifier, shell command, image,
+  mount, or arbitrary destination. Tool results are size-bounded.
+- **Untrusted observations.** Log and metric text is treated as data, never as
+  instructions. Secret-shaped values are redacted before evidence is persisted,
+  and the deterministic proposal gate refuses a proposal that cites
+  prompt-injection content. The agent has no write tool and no shell.
+- **No model authority.** A model diagnosis cannot authorize recovery. The
+  deterministic gate independently requires observed functional failure,
+  deployment evidence matching the authoritative revision/generation, evidence
+  that belongs to the incident's current epoch, and the recorded known-good
+  predecessor as the target. Unsupported conclusions, foreign/nonexistent/stale
+  evidence, malformed provider JSON, provider unavailability, and budget
+  exhaustion all escalate. There is no proposal-injection endpoint.
+- **Bounded and durable.** Server-enforced maxima of 12 tool calls and 120
+  seconds are persisted per investigation epoch, so a worker restart cannot reset
+  the limits or duplicate a logical step trace. Per-provider deadlines and bounded
+  retries count toward the budget.
+- **Lease-guarded writes.** Evidence, step traces, proposals, and escalations are
+  written only while the worker still owns the incident's lease for the current
+  epoch; a stale owner writes nothing.
+- **Separate runtime credentials.** The OpenAI-compatible adapter reads only
+  `MODEL_BASE_URL` / `MODEL_NAME` / `MODEL_API_KEY` from the worker environment.
+  It never reads OpenCode auth or Hermes secrets. Missing credentials fail closed
+  to escalation; the `scripted:demo` adapter is enabled only by the explicit
+  `INVESTIGATION_ADAPTER=scripted` opt-in and every run records its identity.

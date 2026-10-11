@@ -361,6 +361,15 @@ def create_proxy_app(store: DeploymentStore) -> FastAPI:
     async def api_health() -> Response:
         return await _proxy_request(store, "/health")
 
+    @app.get("/api/logs")
+    async def api_logs(lines: int = 50) -> Response:
+        bounded = max(1, min(int(lines), 200))
+        return await _proxy_request(store, f"/logs?lines={bounded}")
+
+    @app.get("/api/metrics")
+    async def api_metrics() -> Response:
+        return await _proxy_request(store, "/metrics")
+
     return app
 
 

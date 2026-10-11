@@ -142,17 +142,27 @@ async def _inject_fault(live: Live, revision: str = BROKEN) -> None:
 async def _awaiting_incident_with_proposal(
     pool: asyncpg.Pool, service_id: str = "demo-api"
 ) -> tuple[uuid.UUID, str, str]:
+    # The worker now auto-investigates `detected` incidents, so this Task 3 suite
+    # deliberately seeds its incident directly in `awaiting_approval` with an
+    # explicit proposal.  That isolates the approval/recovery path under test
+    # instead of racing the investigation stage; it is test-side setup, not a
+    # production debug route.
     repo = IncidentRepository(pool)
     store = DeploymentStore(pool)
-    incident, _ = await repo.ingest_alert(
-        f"e2e-{uuid.uuid4()}", service_id, "broken deployment", {"source": "e2e"}
+    incident_id = uuid.uuid4()
+    await pool.execute(
+        "INSERT INTO incidents "
+        "(id, dedupe_key, service_id, state, summary, alert_payload, detected_at, updated_at, version) "
+        "VALUES ($1, $2, $3, 'awaiting_approval', $4, '{}'::jsonb, now(), now(), 2)",
+        incident_id,
+        f"e2e-{uuid.uuid4()}",
+        service_id,
+        "broken deployment",
     )
-    await repo.transition(incident.id, IncidentState.INVESTIGATING)
-    await repo.transition(incident.id, IncidentState.AWAITING_APPROVAL)
     snapshot = await store.get_snapshot()
     digest = uuid.uuid4().hex
     await repo.create_proposal(
-        incident_id=incident.id,
+        incident_id=incident_id,
         service_id=service_id,
         expected_generation=snapshot.generation,
         current_revision=snapshot.revision,
@@ -160,7 +170,7 @@ async def _awaiting_incident_with_proposal(
         evidence_ids=[],
         digest=digest,
     )
-    return incident.id, digest, snapshot.revision
+    return incident_id, digest, snapshot.revision
 
 
 async def _wait_for_state(

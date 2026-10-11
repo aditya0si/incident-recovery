@@ -29,6 +29,10 @@ from .models import (
     OPERATION_VERIFIED,
     PENDING_RECOVERY_STATES,
     RECOVERY_CLAIMABLE_STATES,
+    RUN_DECIDED,
+    RUN_ESCALATED,
+    RUN_FAILED,
+    RUN_RUNNING,
     SERVICE_ID,
     Approval,
     ApprovalStale,
@@ -39,6 +43,8 @@ from .models import (
     IllegalStateTransition,
     Incident,
     IncidentState,
+    InvestigationRun,
+    InvestigationStep,
     LeaseLost,
     NotFound,
     Operation,
@@ -89,6 +95,7 @@ def _row_to_evidence(row: asyncpg.Record) -> Evidence:
         evidence_type=EvidenceType(row["evidence_type"]),
         observed_at=row["observed_at"],
         payload=row["payload"],
+        epoch=row["epoch"],
     )
 
 
@@ -174,18 +181,21 @@ class IncidentRepository:
         source: str,
         evidence_type: EvidenceType,
         payload: Mapping[str, Any],
+        *,
+        epoch: int = 0,
     ) -> Evidence:
         validate_payload(payload)
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
-                    "INSERT INTO incident_evidence (incident_id, source, evidence_type, payload) "
-                    "VALUES ($1, $2, $3, $4::jsonb) "
-                    "RETURNING id, incident_id, source, evidence_type, observed_at, payload",
+                    "INSERT INTO incident_evidence (incident_id, source, evidence_type, payload, epoch) "
+                    "VALUES ($1, $2, $3, $4::jsonb, $5) "
+                    "RETURNING id, incident_id, source, evidence_type, observed_at, payload, epoch",
                     incident_id,
                     source,
                     EvidenceType(evidence_type).value,
                     dict(payload),
+                    epoch,
                 )
                 await conn.execute(
                     "INSERT INTO incident_events (incident_id, kind, payload) "
@@ -196,12 +206,23 @@ class IncidentRepository:
                 )
         return _row_to_evidence(row)
 
-    async def list_evidence(self, incident_id: UUID) -> list[Evidence]:
-        rows = await self.pool.fetch(
-            "SELECT id, incident_id, source, evidence_type, observed_at, payload "
-            "FROM incident_evidence WHERE incident_id = $1 ORDER BY observed_at, id",
-            incident_id,
-        )
+    async def list_evidence(
+        self, incident_id: UUID, *, epoch: Optional[int] = None
+    ) -> list[Evidence]:
+        if epoch is None:
+            rows = await self.pool.fetch(
+                "SELECT id, incident_id, source, evidence_type, observed_at, payload, epoch "
+                "FROM incident_evidence WHERE incident_id = $1 ORDER BY observed_at, id",
+                incident_id,
+            )
+        else:
+            rows = await self.pool.fetch(
+                "SELECT id, incident_id, source, evidence_type, observed_at, payload, epoch "
+                "FROM incident_evidence WHERE incident_id = $1 AND epoch = $2 "
+                "ORDER BY observed_at, id",
+                incident_id,
+                epoch,
+            )
         return [_row_to_evidence(row) for row in rows]
 
     # --- events ------------------------------------------------------------
@@ -1098,6 +1119,427 @@ class IncidentRepository:
                     payload,
                 )
         return _row_to_incident(row)
+
+
+    async def _assert_lease(
+        self, conn: asyncpg.Connection, incident_id: UUID, worker_id: str, now: datetime
+    ) -> None:
+        row = await conn.fetchrow(
+            "SELECT lease_owner, lease_expires_at FROM incidents WHERE id = $1 FOR UPDATE",
+            incident_id,
+        )
+        if row is None:
+            raise NotFound(f"incident {incident_id} not found")
+        if (
+            row["lease_owner"] != worker_id
+            or row["lease_expires_at"] is None
+            or ensure_utc(row["lease_expires_at"]) <= ensure_utc(now)
+        ):
+            raise LeaseLost(f"lease for {incident_id} not held by {worker_id}")
+
+    async def claim_next_investigation(
+        self,
+        worker_id: str,
+        *,
+        lease_seconds: int = DEFAULT_LEASE_SECONDS,
+        now: Optional[datetime] = None,
+    ) -> Optional[Incident]:
+        """Claim a ``detected``/``investigating`` incident under a durable lease.
+
+        A ``detected`` incident is atomically moved to ``investigating``; an
+        ``investigating`` incident is simply re-leased so a restart resumes the
+        in-progress investigation rather than starting a new epoch.
+        """
+
+        instant = ensure_utc(now or utcnow())
+        expiry = instant + timedelta(seconds=lease_seconds)
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    f"SELECT {_COLS_Q} FROM incidents "
+                    f"WHERE state = ANY($1::text[]) "
+                    f"  AND (lease_expires_at IS NULL OR lease_expires_at <= $2) "
+                    f"ORDER BY detected_at FOR UPDATE SKIP LOCKED LIMIT 1",
+                    [IncidentState.DETECTED.value, IncidentState.INVESTIGATING.value],
+                    instant,
+                )
+                if row is None:
+                    return None
+                previous = row["state"]
+                updated = await conn.fetchrow(
+                    f"UPDATE incidents SET lease_owner = $2, lease_expires_at = $3, "
+                    f"state = $4, updated_at = now(), version = version + 1 "
+                    f"WHERE id = $1 RETURNING {_COLS_Q}",
+                    row["id"],
+                    worker_id,
+                    expiry,
+                    IncidentState.INVESTIGATING.value,
+                )
+                if previous != IncidentState.INVESTIGATING.value:
+                    await conn.execute(
+                        "INSERT INTO incident_events (incident_id, kind, payload) "
+                        "VALUES ($1, $2, $3::jsonb)",
+                        row["id"],
+                        EventKind.STATE_CHANGED.value,
+                        {"to": IncidentState.INVESTIGATING.value},
+                    )
+        return _row_to_incident(updated)
+
+    async def ensure_investigation_run(
+        self,
+        incident_id: UUID,
+        adapter: str,
+        max_seconds: float,
+        *,
+        now: Optional[datetime] = None,
+    ) -> InvestigationRun:
+        """Return the running investigation run, or create a new epoch.
+
+        Restarting a worker reuses the persisted running run (same epoch, same
+        tool-call count, same deadline), so limits are never silently reset.
+        """
+
+        instant = ensure_utc(now or utcnow())
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                existing = await conn.fetchrow(
+                    "SELECT incident_id, epoch, adapter, state, tool_calls, started_at, "
+                    "deadline_at, updated_at, last_error FROM investigation_runs "
+                    "WHERE incident_id = $1 AND state = 'running' "
+                    "ORDER BY epoch DESC LIMIT 1 FOR UPDATE",
+                    incident_id,
+                )
+                if existing is not None:
+                    return _row_to_investigation_run(existing)
+                epoch = await conn.fetchval(
+                    "SELECT COALESCE(MAX(epoch), 0) + 1 FROM investigation_runs "
+                    "WHERE incident_id = $1",
+                    incident_id,
+                )
+                row = await conn.fetchrow(
+                    "INSERT INTO investigation_runs "
+                    "(incident_id, epoch, adapter, state, deadline_at, started_at, updated_at) "
+                    "VALUES ($1, $2, $3, 'running', $4, $5, $5) "
+                    "RETURNING incident_id, epoch, adapter, state, tool_calls, started_at, "
+                    "deadline_at, updated_at, last_error",
+                    incident_id,
+                    epoch,
+                    adapter,
+                    instant + timedelta(seconds=max_seconds),
+                    instant,
+                )
+                await conn.execute(
+                    "INSERT INTO incident_events (incident_id, kind, payload) "
+                    "VALUES ($1, $2, $3::jsonb)",
+                    incident_id,
+                    EventKind.INVESTIGATION_STARTED.value,
+                    {"epoch": epoch, "adapter": adapter},
+                )
+        return _row_to_investigation_run(row)
+
+    async def get_investigation_run(
+        self, incident_id: UUID, epoch: int
+    ) -> Optional[InvestigationRun]:
+        row = await self.pool.fetchrow(
+            "SELECT incident_id, epoch, adapter, state, tool_calls, started_at, "
+            "deadline_at, updated_at, last_error FROM investigation_runs "
+            "WHERE incident_id = $1 AND epoch = $2",
+            incident_id,
+            epoch,
+        )
+        return _row_to_investigation_run(row) if row else None
+
+    async def set_investigation_run_state(
+        self,
+        incident_id: UUID,
+        epoch: int,
+        state: str,
+        *,
+        last_error: Optional[str] = None,
+        now: Optional[datetime] = None,
+    ) -> Optional[InvestigationRun]:
+        row = await self.pool.fetchrow(
+            "UPDATE investigation_runs SET state = $3, "
+            "last_error = COALESCE($4, last_error), updated_at = now() "
+            "WHERE incident_id = $1 AND epoch = $2 "
+            "RETURNING incident_id, epoch, adapter, state, tool_calls, started_at, "
+            "deadline_at, updated_at, last_error",
+            incident_id,
+            epoch,
+            state,
+            last_error,
+        )
+        return _row_to_investigation_run(row) if row else None
+
+    async def record_investigation_step(
+        self,
+        incident_id: UUID,
+        epoch: int,
+        kind: str,
+        payload: Mapping[str, Any],
+        *,
+        worker_id: str,
+        now: Optional[datetime] = None,
+        advance_tool_calls: bool = False,
+    ) -> InvestigationStep:
+        body = dict(payload)
+        validate_payload(body)
+        instant = ensure_utc(now or utcnow())
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await self._assert_lease(conn, incident_id, worker_id, instant)
+                index = await conn.fetchval(
+                    "SELECT COALESCE(MAX(step_index), 0) + 1 FROM investigation_steps "
+                    "WHERE incident_id = $1 AND epoch = $2",
+                    incident_id,
+                    epoch,
+                )
+                row = await conn.fetchrow(
+                    "INSERT INTO investigation_steps "
+                    "(incident_id, epoch, step_index, kind, payload) "
+                    "VALUES ($1, $2, $3, $4, $5::jsonb) "
+                    "RETURNING id, incident_id, epoch, step_index, kind, payload, created_at",
+                    incident_id,
+                    epoch,
+                    index,
+                    kind,
+                    body,
+                )
+                if advance_tool_calls:
+                    await conn.execute(
+                        "UPDATE investigation_runs "
+                        "SET tool_calls = LEAST(tool_calls + 1, 12), updated_at = now() "
+                        "WHERE incident_id = $1 AND epoch = $2",
+                        incident_id,
+                        epoch,
+                    )
+        return _row_to_investigation_step(row)
+
+    async def list_investigation_steps(
+        self, incident_id: UUID, epoch: int
+    ) -> list[InvestigationStep]:
+        rows = await self.pool.fetch(
+            "SELECT id, incident_id, epoch, step_index, kind, payload, created_at "
+            "FROM investigation_steps WHERE incident_id = $1 AND epoch = $2 "
+            "ORDER BY step_index",
+            incident_id,
+            epoch,
+        )
+        return [_row_to_investigation_step(row) for row in rows]
+
+    async def append_investigation_evidence(
+        self,
+        incident_id: UUID,
+        epoch: int,
+        source: str,
+        evidence_type: EvidenceType,
+        payload: Mapping[str, Any],
+        *,
+        worker_id: str,
+        now: Optional[datetime] = None,
+    ) -> Evidence:
+        validate_payload(payload)
+        instant = ensure_utc(now or utcnow())
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await self._assert_lease(conn, incident_id, worker_id, instant)
+                row = await conn.fetchrow(
+                    "INSERT INTO incident_evidence "
+                    "(incident_id, source, evidence_type, payload, epoch) "
+                    "VALUES ($1, $2, $3, $4::jsonb, $5) "
+                    "RETURNING id, incident_id, source, evidence_type, observed_at, payload, epoch",
+                    incident_id,
+                    source,
+                    EvidenceType(evidence_type).value,
+                    dict(payload),
+                    epoch,
+                )
+                await conn.execute(
+                    "INSERT INTO incident_events (incident_id, kind, payload) "
+                    "VALUES ($1, $2, $3::jsonb)",
+                    incident_id,
+                    EventKind.EVIDENCE_RECORDED.value,
+                    {"evidence_id": str(row["id"]), "evidence_type": row["evidence_type"]},
+                )
+        return _row_to_evidence(row)
+
+    async def create_investigation_proposal(
+        self,
+        incident_id: UUID,
+        epoch: int,
+        *,
+        service_id: str,
+        expected_generation: int,
+        current_revision: str,
+        target_revision: str,
+        evidence_ids: Iterable[UUID],
+        digest: str,
+        worker_id: str,
+        now: Optional[datetime] = None,
+    ) -> Proposal:
+        """Persist a gated proposal, but only while the caller still owns the
+        lease and the incident is still ``investigating``.
+
+        A stale owner that lost its lease for the current epoch can therefore
+        never write a proposal or advance the incident.
+        """
+
+        instant = ensure_utc(now or utcnow())
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                current = await conn.fetchrow(
+                    "SELECT lease_owner, lease_expires_at, state FROM incidents "
+                    "WHERE id = $1 FOR UPDATE",
+                    incident_id,
+                )
+                if current is None:
+                    raise NotFound(f"incident {incident_id} not found")
+                lease_ok = (
+                    current["lease_owner"] == worker_id
+                    and current["lease_expires_at"] is not None
+                    and ensure_utc(current["lease_expires_at"]) > instant
+                )
+                if not lease_ok:
+                    raise LeaseLost(f"lease for {incident_id} not held by {worker_id}")
+                if current["state"] != IncidentState.INVESTIGATING.value:
+                    raise IllegalStateTransition(
+                        f"cannot propose while incident is {current['state']}"
+                    )
+                row = await conn.fetchrow(
+                    "INSERT INTO proposals (incident_id, service_id, expected_generation, "
+                    "current_revision, target_revision, evidence_ids, digest) "
+                    "VALUES ($1, $2, $3, $4, $5, $6, $7) "
+                    "RETURNING id, incident_id, service_id, expected_generation, "
+                    "current_revision, target_revision, evidence_ids, digest, created_at",
+                    incident_id,
+                    service_id,
+                    expected_generation,
+                    current_revision,
+                    target_revision,
+                    list(evidence_ids),
+                    digest,
+                )
+                await conn.execute(
+                    "INSERT INTO incident_events (incident_id, kind, payload) "
+                    "VALUES ($1, $2, $3::jsonb)",
+                    incident_id,
+                    EventKind.PROPOSAL_CREATED.value,
+                    {
+                        "proposal_id": str(row["id"]),
+                        "digest": digest,
+                        "epoch": epoch,
+                        "target_revision": target_revision,
+                    },
+                )
+        return _row_to_proposal(row)
+
+    async def escalate_investigation(
+        self,
+        incident_id: UUID,
+        worker_id: str,
+        *,
+        reason: str,
+        now: Optional[datetime] = None,
+        epoch: Optional[int] = None,
+    ) -> Incident:
+        """Escalate an incident only while the caller owns its
+        ``investigating`` lease; a stale owner is refused and changes nothing."""
+
+        instant = ensure_utc(now or utcnow())
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    f"UPDATE incidents SET state = $3, lease_expires_at = NULL, "
+                    f"updated_at = now(), version = version + 1 "
+                    f"WHERE id = $1 AND lease_owner = $2 AND lease_expires_at > $4 "
+                    f"AND state = $5 RETURNING {_COLS_Q}",
+                    incident_id,
+                    worker_id,
+                    IncidentState.ESCALATED.value,
+                    instant,
+                    IncidentState.INVESTIGATING.value,
+                )
+                if row is None:
+                    current = await conn.fetchrow(
+                        f"SELECT {_COLS} FROM incidents WHERE id = $1", incident_id
+                    )
+                    if current is None:
+                        raise NotFound(f"incident {incident_id} not found")
+                    lease_ok = (
+                        current["lease_owner"] == worker_id
+                        and current["lease_expires_at"] is not None
+                        and ensure_utc(current["lease_expires_at"]) > instant
+                    )
+                    if not lease_ok:
+                        raise LeaseLost(f"lease for {incident_id} not held by {worker_id}")
+                    raise IllegalStateTransition(
+                        f"cannot escalate incident in state {current['state']}"
+                    )
+                await conn.execute(
+                    "INSERT INTO incident_events (incident_id, kind, payload) "
+                    "VALUES ($1, $2, $3::jsonb)",
+                    incident_id,
+                    EventKind.ESCALATED.value,
+                    {"reason": reason, "epoch": epoch},
+                )
+        return _row_to_incident(row)
+
+    async def get_deployment_snapshot(self):
+        """Authoritative active deployment snapshot, read from PostgreSQL."""
+
+        from .contracts import DeploymentSnapshot
+
+        row = await self.pool.fetchrow(
+            "SELECT service_id, revision, generation, activated_at, predecessor "
+            "FROM deployment_state WHERE service_id = $1",
+            SERVICE_ID,
+        )
+        if row is None:
+            raise NotFound("deployment_state is not initialised")
+        return DeploymentSnapshot(
+            service_id=row["service_id"],
+            revision=row["revision"],
+            generation=row["generation"],
+            activated_at=row["activated_at"],
+            predecessor=row["predecessor"],
+        )
+
+    async def list_deployment_history(
+        self, *, service_id: str = SERVICE_ID, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        rows = await self.pool.fetch(
+            "SELECT from_revision, to_revision, generation, activated_at "
+            "FROM deployment_history WHERE service_id = $1 ORDER BY id DESC LIMIT $2",
+            service_id,
+            limit,
+        )
+        return [dict(row) for row in rows]
+
+
+def _row_to_investigation_run(row: asyncpg.Record) -> InvestigationRun:
+    return InvestigationRun(
+        incident_id=row["incident_id"],
+        epoch=row["epoch"],
+        adapter=row["adapter"],
+        state=row["state"],
+        tool_calls=row["tool_calls"],
+        started_at=row["started_at"],
+        deadline_at=row["deadline_at"],
+        updated_at=row["updated_at"],
+        last_error=row["last_error"],
+    )
+
+
+def _row_to_investigation_step(row: asyncpg.Record) -> InvestigationStep:
+    return InvestigationStep(
+        id=row["id"],
+        incident_id=row["incident_id"],
+        epoch=row["epoch"],
+        step_index=row["step_index"],
+        kind=row["kind"],
+        payload=row["payload"],
+        created_at=row["created_at"],
+    )
 
 
 def _row_to_proposal(row: asyncpg.Record) -> Proposal:

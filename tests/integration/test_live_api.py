@@ -157,11 +157,13 @@ async def test_incident_persists_across_api_restart(live: LiveStack) -> None:
     reread = httpx.get(f"{live.api_url}/incidents/{incident_id}", timeout=10.0)
     assert reread.status_code == 200, reread.text
     assert reread.json()["id"] == incident_id
-    assert reread.json()["state"] == "detected"
+    # The worker now auto-investigates detected incidents.  With no runtime model
+    # credentials configured it must fail closed and escalate (never silently
+    # substitute a script); the point of this test is that the row survived the
+    # API restart, so any legitimate post-detection state is accepted.
+    assert reread.json()["state"] in {"detected", "investigating", "escalated"}
 
-    # Clean up our own test row only (events cascade); never touch other data.
-    pool = await db_module.create_pool(_host_dsn())
-    try:
-        await pool.execute("DELETE FROM incidents WHERE id = $1", uuid.UUID(incident_id))
-    finally:
-        await pool.close()
+    # The worker auto-investigates detected incidents and may record immutable
+    # evidence, which cannot be deleted (database-enforced).  The audit row is
+    # therefore left in place rather than force-deleted; the assertion above is
+    # the real persistence check.

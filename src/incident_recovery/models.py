@@ -109,6 +109,8 @@ class EventKind(str, Enum):
     RECOVERY_FAILED = "recovery_failed"
     ESCALATED = "escalated"
     FAULT_INJECTED = "fault_injected"
+    INVESTIGATION_STARTED = "investigation_started"
+    DIAGNOSIS = "diagnosis"
 
 
 class EvidenceType(str, Enum):
@@ -233,6 +235,7 @@ class Evidence:
     evidence_type: EvidenceType
     observed_at: datetime
     payload: dict[str, Any]
+    epoch: int = 0
 
 
 @dataclass(frozen=True)
@@ -300,6 +303,83 @@ class Reservation:
     target_revision: str
     created_at: datetime
     released_at: Optional[datetime]
+
+
+# --- Task 4: bounded investigation -------------------------------------------
+
+# Server-enforced maxima.  Configured values may be lower but never higher.
+INVESTIGATION_MAX_TOOL_CALLS = 12
+INVESTIGATION_MAX_SECONDS = 120.0
+INVESTIGATION_KNOWN_GOOD_TARGET = "healthy-v1"
+INVESTIGATION_BROKEN_REVISION = "broken-v2"
+
+
+class InvestigationRunState(str, Enum):
+    """Closed set of persisted investigation-run states."""
+
+    RUNNING = "running"
+    DECIDED = "decided"
+    ESCALATED = "escalated"
+    FAILED = "failed"
+
+
+RUN_RUNNING = InvestigationRunState.RUNNING.value
+RUN_DECIDED = InvestigationRunState.DECIDED.value
+RUN_ESCALATED = InvestigationRunState.ESCALATED.value
+RUN_FAILED = InvestigationRunState.FAILED.value
+
+INVESTIGATION_RUN_TERMINAL: frozenset[str] = frozenset({RUN_DECIDED, RUN_ESCALATED, RUN_FAILED})
+
+
+class InvestigationStepKind(str, Enum):
+    """Closed set of append-only logical step traces for one investigation epoch."""
+
+    RUN_STARTED = "run_started"
+    TOOL_REQUEST = "tool_request"
+    TOOL_RESULT = "tool_result"
+    DIAGNOSIS = "diagnosis"
+    DECISION = "decision"
+    ESCALATION = "escalation"
+
+
+class ModelUnavailable(WorkflowError):
+    """The configured runtime model cannot be reached or is not configured."""
+
+
+class ModelProtocolError(WorkflowError):
+    """The provider returned malformed or unusable step data."""
+
+
+class InvestigationBudgetExhausted(WorkflowError):
+    """The tool-call or wall-clock investigation budget was exhausted."""
+
+
+class InsufficientEvidence(WorkflowError):
+    """The proposal gate refused a conclusion with insufficient/foreign evidence."""
+
+
+@dataclass(frozen=True)
+class InvestigationRun:
+    incident_id: UUID
+    epoch: int
+    adapter: str
+    state: str
+    tool_calls: int
+    started_at: datetime
+    deadline_at: datetime
+    updated_at: datetime
+    last_error: Optional[str]
+
+
+@dataclass(frozen=True)
+class InvestigationStep:
+    id: int
+    incident_id: UUID
+    epoch: int
+    step_index: int
+    kind: str
+    payload: dict[str, Any]
+    created_at: datetime
 
 
 DEFAULT_LEASE_SECONDS = 30

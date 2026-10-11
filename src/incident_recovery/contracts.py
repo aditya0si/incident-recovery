@@ -6,6 +6,7 @@ healthy or broken demo deployment. No caller may supply a destination.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 from uuid import UUID
@@ -332,3 +333,91 @@ def approval_view(approval) -> ApprovalView:
         expires_at=approval.expires_at,
         consumed_by_operation=approval.consumed_by_operation,
     )
+
+
+# --- Task 4: bounded investigation contracts ---------------------------------
+
+ToolName = Literal["health", "logs", "metrics", "deployments"]
+
+
+class ToolRequest(BaseModel):
+    """A bounded read-only observation request.
+
+    Only the four fixed tool names are accepted, and the schema forbids any
+    additional field, so a model can never smuggle a URL, path, container id,
+    shell command, or arbitrary destination into a tool call.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    tool: ToolName
+    reason: str = Field(default="", max_length=280)
+    lines: Optional[int] = Field(default=None, ge=1, le=200)
+
+    @model_validator(mode="after")
+    def _per_tool_arguments(self) -> "ToolRequest":
+        if self.lines is not None and self.tool != "logs":
+            raise ValueError("lines is only valid for the logs tool")
+        return self
+
+
+class Diagnosis(BaseModel):
+    """A bounded, evidence-linked conclusion; never trusted as an authorization."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    symptoms: List[str] = Field(min_length=1, max_length=20)
+    candidate_cause: str = Field(min_length=1, max_length=500)
+    uncertainty: str = Field(min_length=1, max_length=500)
+    evidence_ids: List[UUID] = Field(default_factory=list, max_length=50)
+    proposed_rollback: bool = False
+
+    @model_validator(mode="after")
+    def _symptom_bounds(self) -> "Diagnosis":
+        for symptom in self.symptoms:
+            if len(symptom) > 300:
+                raise ValueError("symptom exceeds 300 characters")
+        return self
+
+
+class ToolObservation(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    evidence_id: UUID
+    tool: str
+    observed_at: datetime
+    summary: Dict[str, Any]
+
+
+class InvestigationContext(BaseModel):
+    """Bounded context passed to the model adapter on each step."""
+
+    model_config = ConfigDict(frozen=True)
+
+    incident_id: UUID
+    service_id: str
+    epoch: int
+    step: int
+    tool_calls_used: int
+    max_tool_calls: int
+    seconds_remaining: float
+    observations: List[ToolObservation] = Field(default_factory=list)
+    adapter_identity: str
+
+
+@dataclass(frozen=True)
+class GateDecision:
+    """Deterministic proposal-gate outcome, independent of model confidence."""
+
+    allowed: bool
+    reason: str
+    target_revision: Optional[str] = None
+    digest: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class InvestigationOutcome:
+    status: str
+    reason: str
+    epoch: int
+    proposal_id: Optional[UUID] = None

@@ -4,15 +4,25 @@ The two demo services use the same image with a different ``DEMO_REVISION``.
 ``healthy-v1`` produces a correct functional result; ``broken-v2`` contains a
 genuine functional regression. Process liveness (``/livez``) stays up on both,
 so liveness is never confused with functional health.
+
+The workload also exposes *real* bounded observations for the investigation
+tools: an in-memory structured log ring buffer (``/logs``) and actual runtime
+request counters (``/metrics``).  These are derived from real handled requests,
+not fabricated monitoring values.
 """
 
 from __future__ import annotations
 
 import os
+import time
+from collections import deque
+from datetime import datetime, timezone
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
+
+MAX_LOG_LINES = 200
 
 
 class FunctionalRegression(RuntimeError):
@@ -31,6 +41,30 @@ def compute_result(revision: str) -> int:
 
 def create_demo_app(revision: str) -> FastAPI:
     app = FastAPI(title=f"demo-api ({revision})", docs_url=None, redoc_url=None)
+
+    started_at = time.time()
+    counters = {"requests_total": 0, "requests_failed": 0, "by_revision": {}}
+    logs: deque[dict] = deque(maxlen=MAX_LOG_LINES)
+
+    @app.middleware("http")
+    async def _observe(request: Request, call_next):
+        counters["requests_total"] += 1
+        response = await call_next(request)
+        status = response.status_code
+        if status >= 500:
+            counters["requests_failed"] += 1
+        counters["by_revision"][revision] = counters["by_revision"].get(revision, 0) + 1
+        logs.append(
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "level": "error" if status >= 500 else "info",
+                "path": request.url.path,
+                "status": status,
+                "revision": revision,
+                "message": f"{request.method} {request.url.path} -> {status}",
+            }
+        )
+        return response
 
     @app.get("/livez")
     async def livez() -> dict:
@@ -59,6 +93,25 @@ def create_demo_app(revision: str) -> FastAPI:
                 content={"status": "fail", "revision": revision, "error": str(exc)},
             )
         return {"status": "pass", "revision": revision}
+
+    @app.get("/logs")
+    async def get_logs(lines: int = Query(default=50, ge=1, le=MAX_LOG_LINES)) -> dict:
+        # Bounded structured recent logs. Contents are data, never instructions.
+        return {
+            "revision": revision,
+            "count": len(logs),
+            "lines": list(logs)[-lines:],
+        }
+
+    @app.get("/metrics")
+    async def get_metrics() -> dict:
+        return {
+            "revision": revision,
+            "uptime_seconds": round(time.time() - started_at, 3),
+            "requests_total": counters["requests_total"],
+            "requests_failed": counters["requests_failed"],
+            "by_revision": dict(counters["by_revision"]),
+        }
 
     return app
 
