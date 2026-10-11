@@ -39,10 +39,23 @@ def _wait_ready(url: str, timeout: float = 90.0) -> None:
 
 @pytest.fixture(scope="module")
 def ready() -> None:
+    # Prerequisites fail loudly: no silent skip may ever masquerade as success.
     if not INTERNAL_TOKEN:
-        pytest.skip("INTERNAL_TOKEN is not set; source .env before running E2E")
-    _wait_ready(f"{GATEWAY_URL}/healthz")
-    _wait_ready(f"{CONTROL_URL}/healthz")
+        pytest.fail(
+            "INTERNAL_TOKEN is not set. Source .env and bring up the stack with the "
+            "test-only Compose override so gateway-control is reachable (see README)."
+        )
+    try:
+        _wait_ready(f"{GATEWAY_URL}/healthz")
+    except AssertionError as exc:
+        pytest.fail(f"public gateway not reachable; bring up the stack first: {exc}")
+    try:
+        _wait_ready(f"{CONTROL_URL}/healthz")
+    except AssertionError as exc:
+        pytest.fail(
+            "internal switch not reachable on the host. Bring the stack up with "
+            f"`compose.yaml + compose.test.yaml` (test-only override): {exc}"
+        )
 
 
 def _switch(operation_id: uuid.UUID, generation: int, target: str) -> httpx.Response:

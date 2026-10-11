@@ -1,0 +1,190 @@
+"""PostgreSQL connection pool and versioned schema bootstrap.
+
+The database is the single source of truth.  Schema evolution is tracked in
+``schema_version`` and applied inside an advisory-locked transaction so that
+concurrent service starts cannot race.  Migration 1 is the Task 1 deployment
+schema (owned by :mod:`incident_recovery.gateway`); migration 2 adds the durable
+incident workflow: incidents, immutable evidence, append-only events, and the
+proposal/approval/operation tables later milestones build on.
+
+Only asyncpg is used.  JSON and JSONB are encoded/decoded transparently.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Optional
+
+import asyncpg
+
+from .gateway import SCHEMA_SQL as DEPLOYMENT_SCHEMA_SQL
+
+_SCHEMA_VERSION_DDL = """
+CREATE TABLE IF NOT EXISTS schema_version (
+    version    INTEGER PRIMARY KEY,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
+# Every incident workflow table, constraint, index, and immutability rule that
+# Task 2 owns.  Later milestones extend this list with new versioned migrations.
+INCIDENT_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS incidents (
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    dedupe_key        TEXT NOT NULL UNIQUE,
+    service_id        TEXT NOT NULL,
+    state             TEXT NOT NULL DEFAULT 'detected',
+    summary           TEXT,
+    alert_payload     JSONB NOT NULL DEFAULT '{}'::jsonb,
+    detected_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    version           INTEGER NOT NULL DEFAULT 0,
+    lease_owner       TEXT,
+    lease_expires_at  TIMESTAMPTZ,
+    CONSTRAINT incidents_state_valid CHECK (state IN (
+        'detected','investigating','awaiting_approval','recovering','verifying',
+        'resolved','escalated','rejected','recovery_failed')),
+    CONSTRAINT incidents_alert_payload_size CHECK (octet_length(alert_payload::text) <= 16384),
+    CONSTRAINT incidents_summary_length CHECK (summary IS NULL OR char_length(summary) <= 500)
+);
+CREATE INDEX IF NOT EXISTS incidents_state_idx ON incidents (state);
+CREATE INDEX IF NOT EXISTS incidents_detected_idx ON incidents (detected_at DESC);
+
+CREATE TABLE IF NOT EXISTS incident_evidence (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    -- RESTRICT (not CASCADE): an incident that has recorded evidence cannot be
+    -- deleted, and the no-delete rule below never rewrites a cascade query.
+    incident_id    UUID NOT NULL REFERENCES incidents(id) ON DELETE RESTRICT,
+    source         TEXT NOT NULL,
+    evidence_type  TEXT NOT NULL,
+    observed_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    payload        JSONB NOT NULL,
+    CONSTRAINT incident_evidence_type_valid CHECK (evidence_type IN (
+        'alert','log_excerpt','metric','health_check','deployment_history','note')),
+    CONSTRAINT incident_evidence_payload_size CHECK (octet_length(payload::text) <= 16384)
+);
+CREATE INDEX IF NOT EXISTS incident_evidence_incident_idx
+    ON incident_evidence (incident_id, observed_at, id);
+
+-- Evidence is immutable: updates and deletes are silently refused at the
+-- database level, independently of application code.
+DROP RULE IF EXISTS incident_evidence_no_update ON incident_evidence;
+CREATE RULE incident_evidence_no_update AS ON UPDATE TO incident_evidence DO INSTEAD NOTHING;
+DROP RULE IF EXISTS incident_evidence_no_delete ON incident_evidence;
+CREATE RULE incident_evidence_no_delete AS ON DELETE TO incident_evidence DO INSTEAD NOTHING;
+
+CREATE TABLE IF NOT EXISTS incident_events (
+    id           BIGSERIAL PRIMARY KEY,
+    incident_id  UUID NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
+    kind         TEXT NOT NULL,
+    payload      JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT incident_events_kind_valid CHECK (kind IN (
+        'detected','state_changed','evidence_recorded','proposal_created',
+        'approval_requested','approved','rejected','recovery_started',
+        'recovery_verified','recovery_failed','escalated','fault_injected')),
+    CONSTRAINT incident_events_payload_size CHECK (octet_length(payload::text) <= 16384)
+);
+CREATE INDEX IF NOT EXISTS incident_events_incident_idx ON incident_events (incident_id, id);
+
+CREATE TABLE IF NOT EXISTS proposals (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    incident_id         UUID NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
+    service_id          TEXT NOT NULL,
+    expected_generation INTEGER NOT NULL,
+    current_revision    TEXT NOT NULL,
+    target_revision     TEXT NOT NULL,
+    evidence_ids        UUID[] NOT NULL DEFAULT '{}',
+    digest              TEXT NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT proposals_digest_unique UNIQUE (incident_id, digest)
+);
+CREATE INDEX IF NOT EXISTS proposals_incident_idx ON proposals (incident_id);
+
+CREATE TABLE IF NOT EXISTS approvals (
+    id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    incident_id           UUID NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
+    proposal_id           UUID NOT NULL REFERENCES proposals(id) ON DELETE CASCADE,
+    proposal_digest       TEXT NOT NULL,
+    service_id            TEXT NOT NULL,
+    expected_revision     TEXT NOT NULL,
+    target_revision       TEXT NOT NULL,
+    actor                 TEXT NOT NULL,
+    status                TEXT NOT NULL DEFAULT 'pending',
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at            TIMESTAMPTZ NOT NULL,
+    consumed_by_operation UUID
+);
+CREATE INDEX IF NOT EXISTS approvals_incident_idx ON approvals (incident_id, status);
+
+CREATE TABLE IF NOT EXISTS recovery_operations (
+    id               UUID PRIMARY KEY,
+    incident_id      UUID NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
+    approval_id      UUID REFERENCES approvals(id),
+    status           TEXT NOT NULL DEFAULT 'pending',
+    target_revision  TEXT NOT NULL,
+    result           JSONB,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS recovery_operations_incident_idx
+    ON recovery_operations (incident_id, status);
+"""
+
+MIGRATIONS: tuple[tuple[int, str], ...] = (
+    (1, DEPLOYMENT_SCHEMA_SQL),
+    (2, INCIDENT_SCHEMA_SQL),
+)
+
+_ADVISORY_LOCK_KEY = 7762002
+
+
+async def _init_connection(conn: asyncpg.Connection) -> None:
+    for type_name in ("json", "jsonb"):
+        await conn.set_type_codec(
+            type_name,
+            encoder=json.dumps,
+            decoder=json.loads,
+            schema="pg_catalog",
+        )
+
+
+async def create_pool(
+    dsn: str,
+    *,
+    schema: Optional[str] = None,
+    min_size: int = 1,
+    max_size: int = 10,
+) -> asyncpg.Pool:
+    """Create a pool, optionally bound to an isolated ``schema`` search path."""
+
+    server_settings = {"search_path": schema} if schema else None
+    return await asyncpg.create_pool(
+        dsn=dsn,
+        min_size=min_size,
+        max_size=max_size,
+        init=_init_connection,
+        server_settings=server_settings,
+    )
+
+
+async def bootstrap_schema(pool: asyncpg.Pool) -> int:
+    """Apply outstanding versioned migrations; returns the applied version.
+
+    The advisory lock makes concurrent bootstraps safe, and each migration is
+    applied exactly once per database/schema.
+    """
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock($1)", _ADVISORY_LOCK_KEY)
+            await conn.execute(_SCHEMA_VERSION_DDL)
+            current = await conn.fetchval("SELECT COALESCE(MAX(version), 0) FROM schema_version")
+            for version, sql in MIGRATIONS:
+                if version > current:
+                    await conn.execute(sql)
+                    await conn.execute(
+                        "INSERT INTO schema_version (version) VALUES ($1)", version
+                    )
+                    current = version
+    return current

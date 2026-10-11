@@ -1,0 +1,17 @@
+# Test-only Compose override.
+#
+# The default stack intentionally does NOT publish gateway-control on the host:
+# the internal switch must be reachable only over the internal network so it is
+# not a permanent host-facing bypass of the forthcoming approval gate.  Task 1's
+# real Docker E2E suite still needs to exercise that switch directly, so this
+# override, used only for tests, republishes it on host loopback.
+#
+# Usage:
+#   docker compose -p incident-recovery -f compose.yaml -f compose.test.yaml up --build -d --wait
+#   uv run pytest tests/e2e/test_deployment.py -v
+#   docker compose -p incident-recovery up --build -d --wait   # restore default (no host control port)
+
+services:
+  gateway-control:
+    ports:
+      - "127.0.0.1:${CONTROL_PORT}:8000"
