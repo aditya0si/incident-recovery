@@ -35,11 +35,10 @@ from .contracts import (
     SwitchRequest,
 )
 from .models import ensure_utc
+from .service_profile import DEMO_PROFILE, ServiceProfile
 
-TARGETS: dict[str, str] = {
-    "healthy-v1": "http://demo-healthy-v1:8000",
-    "broken-v2": "http://demo-broken-v2:8000",
-}
+# Backwards-compatible demo destination map. Unknown revisions return None.
+TARGETS: dict[str, str] = dict(DEMO_PROFILE.revision_targets)
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS deployment_state (
@@ -72,19 +71,34 @@ CREATE TABLE IF NOT EXISTS deployment_history (
     operation_id  UUID NOT NULL,
     activated_at  TIMESTAMPTZ NOT NULL
 );
-
-INSERT INTO deployment_state (service_id, revision, generation, activated_at, predecessor)
-VALUES ('demo-api', 'healthy-v1', 1, now(), NULL)
-ON CONFLICT (service_id) DO NOTHING;
 """
 
 _STATE_COLUMNS = "service_id, revision, generation, activated_at, predecessor"
 
 
-def target_for_revision(revision: str) -> Optional[str]:
+async def ensure_deployment_state(pool, profile: ServiceProfile) -> None:
+    """Seed the profile's initial healthy generation exactly once (idempotent).
+
+    The initial row is bound to the profile's ``service_id`` and healthy
+    revision, so a staging control plane can never inherit the demo's
+    deployment record even over a shared database server.
+    """
+
+    await pool.execute(
+        "INSERT INTO deployment_state (service_id, revision, generation, activated_at, "
+        "predecessor) VALUES ($1, $2, 1, now(), NULL) ON CONFLICT (service_id) DO NOTHING",
+        profile.service_id,
+        profile.healthy_revision,
+    )
+
+
+def target_for_revision(
+    revision: str, *, profile: Optional[ServiceProfile] = None
+) -> Optional[str]:
     """Fixed revision -> Compose DNS destination. Unknown revisions return None."""
 
-    return TARGETS.get(revision)
+    active = profile or DEMO_PROFILE
+    return active.target_for(revision)
 
 
 def evaluate_switch(
@@ -92,18 +106,25 @@ def evaluate_switch(
     request: SwitchRequest,
     prior: Optional[OperationRecord],
     now: datetime,
+    *,
+    service_id: str = SERVICE_ID,
+    revisions: Optional[tuple[str, ...]] = None,
 ) -> SwitchDecision:
     """Pure compare-and-set / idempotency decision.
 
     * exact replay of a recorded operation returns the recorded result
     * a conflicting replay (same operation id, different request) is refused
     * a stale ``expected_generation`` is refused
+    * a target outside the profile's fixed revision set is refused
     * otherwise the switch is applied and the generation increments
+
+    ``service_id`` and ``revisions`` default to the demo identity so the demo
+    behaviour and its tests are unchanged; a staging caller supplies its own.
     """
 
     if prior is not None:
         if (
-            prior.service_id != SERVICE_ID
+            prior.service_id != service_id
             or prior.expected_generation != request.expected_generation
             or prior.target_revision != request.target_revision
             or (prior.scope is not None and prior.scope != request.scope)
@@ -111,11 +132,14 @@ def evaluate_switch(
             return SwitchDecision(status="conflict", snapshot=current)
         return SwitchDecision(status="replayed", snapshot=prior.snapshot)
 
+    if revisions is not None and request.target_revision not in revisions:
+        return SwitchDecision(status="unauthorized", snapshot=current)
+
     if request.expected_generation != current.generation:
         return SwitchDecision(status="stale", snapshot=current)
 
     applied = DeploymentSnapshot(
-        service_id=SERVICE_ID,
+        service_id=service_id,
         revision=request.target_revision,
         generation=current.generation + 1,
         activated_at=now,
@@ -135,20 +159,40 @@ def _row_to_snapshot(row: asyncpg.Record) -> DeploymentSnapshot:
 
 
 class DeploymentStore:
-    """PostgreSQL-backed authoritative deployment state and operation records."""
+    """PostgreSQL-backed authoritative deployment state and operation records.
 
-    def __init__(self, pool: asyncpg.Pool) -> None:
+    The bound :class:`~incident_recovery.service_profile.ServiceProfile` fixes the
+    service identity and the closed revision set, so the same store serves the
+    demo (default) and the isolated staging workload without any wildcard
+    service matching.
+    """
+
+    def __init__(
+        self, pool: asyncpg.Pool, *, profile: Optional[ServiceProfile] = None
+    ) -> None:
         self._pool = pool
+        self._profile = profile or DEMO_PROFILE
+        self._service_id = self._profile.service_id
+        self._revisions = self._profile.revisions()
+
+    @property
+    def profile(self) -> ServiceProfile:
+        return self._profile
+
+    @property
+    def service_id(self) -> str:
+        return self._service_id
 
     async def ensure_schema(self) -> None:
         async with self._pool.acquire() as conn:
             await conn.execute(SCHEMA_SQL)
+        await ensure_deployment_state(self._pool, self._profile)
 
     async def get_snapshot(self) -> DeploymentSnapshot:
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 f"SELECT {_STATE_COLUMNS} FROM deployment_state WHERE service_id = $1",
-                SERVICE_ID,
+                self._service_id,
             )
         if row is None:
             raise RuntimeError("deployment_state is not initialised")
@@ -206,7 +250,7 @@ class DeploymentStore:
         now = ensure_utc(row["admission_now"])
         if row["op_status"] not in ("pending", "executing"):
             return False, now
-        if row["approval_service"] != SERVICE_ID:
+        if row["approval_service"] != self._service_id:
             return False, now
         if row["approval_revision"] != current.revision:
             return False, now
@@ -231,7 +275,7 @@ class DeploymentStore:
                 state_row = await conn.fetchrow(
                     f"SELECT {_STATE_COLUMNS} FROM deployment_state "
                     "WHERE service_id = $1 FOR UPDATE",
-                    SERVICE_ID,
+                    self._service_id,
                 )
                 if state_row is None:
                     raise RuntimeError("deployment_state is not initialised")
@@ -264,7 +308,7 @@ class DeploymentStore:
                 if (
                     reservation is None
                     or reservation["status"] != "active"
-                    or reservation["service_id"] != SERVICE_ID
+                    or reservation["service_id"] != self._service_id
                     or reservation["scope"] != request.scope
                     or reservation["expected_generation"] != request.expected_generation
                     or reservation["target_revision"] != request.target_revision
@@ -287,7 +331,14 @@ class DeploymentStore:
                 else:
                     now = await conn.fetchval("SELECT clock_timestamp()")
 
-                decision = evaluate_switch(current, request, prior, now)
+                decision = evaluate_switch(
+                    current,
+                    request,
+                    prior,
+                    now,
+                    service_id=self._service_id,
+                    revisions=self._revisions,
+                )
 
                 if decision.status == "applied":
                     snap = decision.snapshot
@@ -306,7 +357,7 @@ class DeploymentStore:
                             snap.generation,
                             snap.activated_at,
                             snap.predecessor,
-                            SERVICE_ID,
+                            self._service_id,
                             request.operation_id,
                         )
                         if updated == "UPDATE 0":
@@ -319,7 +370,7 @@ class DeploymentStore:
                             snap.generation,
                             snap.activated_at,
                             snap.predecessor,
-                            SERVICE_ID,
+                            self._service_id,
                         )
                     await conn.execute(
                         "INSERT INTO deployment_operations (operation_id, service_id, "
@@ -327,7 +378,7 @@ class DeploymentStore:
                         "result_generation, result_activated_at, result_predecessor, scope) "
                         "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
                         request.operation_id,
-                        SERVICE_ID,
+                        self._service_id,
                         request.expected_generation,
                         request.target_revision,
                         snap.revision,
@@ -340,7 +391,7 @@ class DeploymentStore:
                         "INSERT INTO deployment_history (service_id, from_revision, "
                         "to_revision, generation, operation_id, activated_at) "
                         "VALUES ($1, $2, $3, $4, $5, $6)",
-                        SERVICE_ID,
+                        self._service_id,
                         current.revision,
                         snap.revision,
                         snap.generation,
@@ -349,12 +400,11 @@ class DeploymentStore:
                     )
                 return decision
 
-    @staticmethod
-    def _exact_replay(prior: OperationRecord, request: SwitchRequest) -> bool:
+    def _exact_replay(self, prior: OperationRecord, request: SwitchRequest) -> bool:
         """True only for an exact operation/scope/request match (no new effect)."""
 
         return (
-            prior.service_id == SERVICE_ID
+            prior.service_id == self._service_id
             and prior.expected_generation == request.expected_generation
             and prior.target_revision == request.target_revision
             and prior.scope == request.scope

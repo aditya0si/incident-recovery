@@ -663,6 +663,7 @@ class IncidentRepository:
         *,
         ttl_seconds: int = 300,
         now: Optional[datetime] = None,
+        service_id: str = SERVICE_ID,
     ) -> tuple[Approval, Operation, bool]:
         """Authorize the exact proposal digest.
 
@@ -713,14 +714,14 @@ class IncidentRepository:
                 state_row = await conn.fetchrow(
                     "SELECT service_id, revision, generation, activated_at, predecessor "
                     "FROM deployment_state WHERE service_id = $1 FOR UPDATE",
-                    SERVICE_ID,
+                    service_id,
                 )
                 if state_row is None:
                     raise NotFound("deployment_state is not initialised")
 
                 target = proposal["target_revision"]
-                if proposal["service_id"] != SERVICE_ID:
-                    raise ApprovalStale("proposal service is not the fixed demo service")
+                if proposal["service_id"] != service_id:
+                    raise ApprovalStale("proposal service does not match the bound service")
                 if (
                     proposal["expected_generation"] != state_row["generation"]
                     or proposal["current_revision"] != state_row["revision"]
@@ -739,7 +740,7 @@ class IncidentRepository:
                     incident_id,
                     proposal["id"],
                     proposal_digest,
-                    SERVICE_ID,
+                    service_id,
                     state_row["revision"],
                     target,
                     actor,
@@ -755,7 +756,7 @@ class IncidentRepository:
                     incident_id,
                     approval_row["id"],
                     target,
-                    SERVICE_ID,
+                    service_id,
                     state_row["generation"],
                 )
 
@@ -764,7 +765,7 @@ class IncidentRepository:
                         "INSERT INTO deployment_reservations (operation_id, service_id, scope, "
                         "expected_generation, target_revision) VALUES ($1, $2, 'recovery', $3, $4)",
                         operation_id,
-                        SERVICE_ID,
+                        service_id,
                         state_row["generation"],
                         target,
                     )
@@ -1524,7 +1525,7 @@ class IncidentRepository:
                 )
         return _row_to_incident(row)
 
-    async def get_deployment_snapshot(self):
+    async def get_deployment_snapshot(self, *, service_id: str = SERVICE_ID):
         """Authoritative active deployment snapshot, read from PostgreSQL."""
 
         from .contracts import DeploymentSnapshot
@@ -1532,7 +1533,7 @@ class IncidentRepository:
         row = await self.pool.fetchrow(
             "SELECT service_id, revision, generation, activated_at, predecessor "
             "FROM deployment_state WHERE service_id = $1",
-            SERVICE_ID,
+            service_id,
         )
         if row is None:
             raise NotFound("deployment_state is not initialised")

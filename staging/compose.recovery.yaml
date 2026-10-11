@@ -1,0 +1,17 @@
+# Driver-only override for the Task 3 staging recovery harness.
+#
+# It publishes the isolated *control* PostgreSQL, the workload PostgreSQL and
+# the workload Redis on loopback so the host-side recovery driver can read the
+# authoritative control store and independently probe the workload dependencies
+# (which it stops for the dependency-outage scenario).  None of this is part of
+# the default stack.
+services:
+  control-postgres:
+    ports:
+      - "127.0.0.1:${STAGING_CONTROL_DB_PORT:-18094}:5432"
+  postgres:
+    ports:
+      - "127.0.0.1:${STAGING_WORKLOAD_DB_PORT:-18096}:5432"
+  redis:
+    ports:
+      - "127.0.0.1:${STAGING_WORKLOAD_REDIS_PORT:-18097}:6379"

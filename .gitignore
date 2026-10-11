@@ -26,5 +26,7 @@ Thumbs.db
 
 # Staging isolation artifacts (generated; never committed)
 staging/.env
+staging/.control.env
 staging/vendor/
+staging/.state/
 

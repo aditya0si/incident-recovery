@@ -173,6 +173,197 @@ services:
     healthcheck: *worker-ready
     restart: unless-stopped
 
+  # --- Task 3: isolated recovery control plane (opt-in `recovery` profile) ---
+  #
+  # Everything below is gated behind the `recovery` profile so the Task 1
+  # baseline stack is byte-for-byte unaffected by a default `up`.  The control
+  # plane runs on its OWN PostgreSQL server (control-postgres) so the workload
+  # dependencies (postgres/redis) can be taken down independently without taking
+  # the incident store with them.
+
+  control-postgres:
+    image: postgres:16-alpine
+    profiles: ["recovery"]
+    environment:
+      POSTGRES_USER: ${STAGING_CONTROL_DB_USER}
+      POSTGRES_PASSWORD: ${STAGING_CONTROL_DB_PASSWORD}
+      POSTGRES_DB: ${STAGING_CONTROL_DB}
+    volumes:
+      - controlpgdata:/var/lib/postgresql/data
+    networks:
+      - staging_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${STAGING_CONTROL_DB_USER} -d ${STAGING_CONTROL_DB}"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+      start_period: 5s
+
+  # The deliberately faulty tenant API: the same pinned source with the isolated,
+  # transparently-labelled patch applied to the real authenticated business
+  # handler.  It shares the compatible workload database and schema.
+  tenant-api-faulty:
+    profiles: ["recovery"]
+    build:
+      context: ./vendor/tenant-api-faulty
+      dockerfile: Dockerfile
+    image: incident-recovery-staging-tenant-api-faulty:${STAGING_SOURCE_SHORT_SHA:-a6f715a}
+    entrypoint: ["/bin/api"]
+    environment:
+      APP_ENV: staging
+      PORT: "8080"
+      DATABASE_URL: postgres://app_rw:${STAGING_APP_PASSWORD}@postgres:5432/${STAGING_DB}?sslmode=disable
+      REDIS_URL: redis://:${STAGING_REDIS_PASSWORD}@redis:6379/0
+      JWT_SECRET: ${STAGING_JWT_SECRET}
+      LOG_LEVEL: info
+      TRUSTED_PROXY_CIDRS: ""
+      STAGING_REVISION_LABEL: injected-fault
+    networks:
+      - staging_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      app-role-provision:
+        condition: service_completed_successfully
+    healthcheck: *api-ready
+
+  # Stable staging traffic gateway (proxy). Routes the fixed /v1 business
+  # surface to the active revision and stamps authoritative identity headers.
+  staging-gateway:
+    profiles: ["recovery"]
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: incident-recovery-staging-gateway:local
+    command: ["python", "-m", "incident_recovery.staging.gateway"]
+    environment:
+      SERVICE_PROFILE: staging
+      STAGING_GATEWAY_ROLE: proxy
+      PORT: "8081"
+      DATABASE_URL: postgres://${STAGING_CONTROL_DB_USER}:${STAGING_CONTROL_DB_PASSWORD}@control-postgres:5432/${STAGING_CONTROL_DB}
+    ports:
+      - "127.0.0.1:${STAGING_GATEWAY_PORT}:8081"
+    networks:
+      - staging_net
+    depends_on:
+      api:
+        condition: service_healthy
+      tenant-api-faulty:
+        condition: service_healthy
+      control-postgres:
+        condition: service_healthy
+
+  staging-gateway-control:
+    profiles: ["recovery"]
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: incident-recovery-staging-gateway:local
+    command: ["python", "-m", "incident_recovery.staging.gateway"]
+    environment:
+      SERVICE_PROFILE: staging
+      STAGING_GATEWAY_ROLE: control
+      PORT: "8081"
+      DATABASE_URL: postgres://${STAGING_CONTROL_DB_USER}:${STAGING_CONTROL_DB_PASSWORD}@control-postgres:5432/${STAGING_CONTROL_DB}
+      INTERNAL_TOKEN: ${STAGING_INTERNAL_TOKEN}
+    networks:
+      - staging_net
+    depends_on:
+      control-postgres:
+        condition: service_healthy
+
+  staging-executor:
+    profiles: ["recovery"]
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: incident-recovery-staging-gateway:local
+    command: ["python", "-m", "incident_recovery.executor"]
+    environment:
+      PORT: "8000"
+      DATABASE_URL: postgres://${STAGING_CONTROL_DB_USER}:${STAGING_CONTROL_DB_PASSWORD}@control-postgres:5432/${STAGING_CONTROL_DB}
+      INTERNAL_TOKEN: ${STAGING_INTERNAL_TOKEN}
+      GATEWAY_INTERNAL_URL: http://staging-gateway-control:8081
+    networks:
+      - staging_net
+    depends_on:
+      control-postgres:
+        condition: service_healthy
+      staging-gateway-control:
+        condition: service_started
+
+  staging-control-api:
+    profiles: ["recovery"]
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: incident-recovery-staging-gateway:local
+    command: ["python", "-m", "incident_recovery.staging.control"]
+    environment:
+      PORT: "8000"
+      SERVICE_PROFILE: staging
+      DATABASE_URL: postgres://${STAGING_CONTROL_DB_USER}:${STAGING_CONTROL_DB_PASSWORD}@control-postgres:5432/${STAGING_CONTROL_DB}
+      OPERATOR_TOKEN: ${STAGING_OPERATOR_TOKEN}
+      INTERNAL_TOKEN: ${STAGING_INTERNAL_TOKEN}
+      GATEWAY_INTERNAL_URL: http://staging-gateway-control:8081
+      ALLOWED_ORIGINS: http://127.0.0.1:${STAGING_CONSOLE_PORT},http://localhost:${STAGING_CONSOLE_PORT}
+    ports:
+      - "127.0.0.1:${STAGING_CONTROL_API_PORT}:8000"
+    networks:
+      - staging_net
+    depends_on:
+      control-postgres:
+        condition: service_healthy
+
+  staging-control-worker:
+    profiles: ["recovery"]
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: incident-recovery-staging-gateway:local
+    command: ["python", "-m", "incident_recovery.staging.control_worker"]
+    environment:
+      SERVICE_PROFILE: staging
+      DATABASE_URL: postgres://${STAGING_CONTROL_DB_USER}:${STAGING_CONTROL_DB_PASSWORD}@control-postgres:5432/${STAGING_CONTROL_DB}
+      INTERNAL_TOKEN: ${STAGING_INTERNAL_TOKEN}
+      EXECUTOR_URL: http://staging-executor:8000
+      GATEWAY_URL: http://staging-gateway:8081
+      # The tenant credential is supplied by the operator harness after it
+      # registers a synthetic tenant; it is never committed or logged.
+      STAGING_TENANT_ID: ${STAGING_TENANT_ID:-}
+      STAGING_TENANT_TOKEN: ${STAGING_TENANT_TOKEN:-}
+      STAGING_PG_HOST: postgres
+      STAGING_PG_PORT: "5432"
+      STAGING_REDIS_HOST: redis
+      STAGING_REDIS_PORT: "6379"
+      WORKER_ID: staging-worker-1
+    networks:
+      - staging_net
+    depends_on:
+      control-postgres:
+        condition: service_healthy
+      staging-gateway:
+        condition: service_started
+
+  # Reuses the reviewed console image with an isolated same-origin nginx config
+  # pointed at the staging control API. No broad new UI design.
+  staging-console:
+    profiles: ["recovery"]
+    image: incident-recovery-console:local
+    volumes:
+      - ../frontend/nginx.staging.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "127.0.0.1:${STAGING_CONSOLE_PORT}:80"
+    networks:
+      - staging_net
+    depends_on:
+      staging-control-api:
+        condition: service_started
+
 networks:
   staging_net:
     name: incident-recovery-staging-net
@@ -183,3 +374,5 @@ volumes:
     name: incident-recovery-staging-pgdata
   redisdata:
     name: incident-recovery-staging-redisdata
+  controlpgdata:
+    name: incident-recovery-staging-controlpgdata

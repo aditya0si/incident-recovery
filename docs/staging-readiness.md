@@ -137,11 +137,19 @@ containers (ports `18080`–`18083`, `15432`) were observed present before and a
 the staging baseline. This baseline does not run the demo's full regression suite;
 that independent run belongs to Task 5.
 
-## Remaining blockers / out of scope for Task 1
+## Task 3: real injected fault and approved recovery
+
+The injected faulty revision, the isolated staging traffic gateway/control plane,
+and the operator-approved real recovery are implemented and recorded in
+`docs/staging-recovery.md`. Task 3 uses the `recovery` Compose profile and a
+separate control database, so the default `up` (and this document) remain the
+Task 1 baseline. Runtime provider eligibility is still **blocked**: Task 3 runs
+through the labelled `scripted:tenant-api-staging` adapter, not a live model.
+
+## Remaining blockers / out of scope
 
 - Live paid provider eligibility and bounded live investigation (Task 2).
-- Injected faulty staging revision, real recovery, and dependency-outage escalation
-  (Task 3).
 - Predeclared 12-case evaluation batch (Task 4) and independent full-verification
   review (Task 5).
-- The staging gateway/console ports are reserved but not implemented in Task 1.
+- The staging gateway/console are implemented for Task 3 under the `recovery`
+  profile; live paid evaluation and the full demo regression belong to Tasks 4–5.

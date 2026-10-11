@@ -11,3 +11,8 @@ docs
 *.egg-info
 dist
 build
+staging/vendor
+staging/.env
+staging/.control.env
+staging/.state
+frontend

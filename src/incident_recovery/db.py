@@ -299,13 +299,20 @@ async def create_pool(
     )
 
 
-async def bootstrap_schema(pool: asyncpg.Pool) -> int:
+async def bootstrap_schema(pool: asyncpg.Pool, *, profile=None) -> int:
     """Apply outstanding versioned migrations; returns the applied version.
 
     The advisory lock makes concurrent bootstraps safe, and each migration is
-    applied exactly once per database/schema.
+    applied exactly once per database/schema.  After the migrations the bound
+    profile's initial healthy deployment row is seeded idempotently, so a
+    staging control database is initialised for the staging service and never
+    inherits the demo's deployment record.
     """
 
+    from .gateway import ensure_deployment_state
+    from .service_profile import DEMO_PROFILE
+
+    active = profile or DEMO_PROFILE
     async with pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute("SELECT pg_advisory_xact_lock($1)", _ADVISORY_LOCK_KEY)
@@ -318,4 +325,5 @@ async def bootstrap_schema(pool: asyncpg.Pool) -> int:
                         "INSERT INTO schema_version (version) VALUES ($1)", version
                     )
                     current = version
+    await ensure_deployment_state(pool, active)
     return current

@@ -86,6 +86,21 @@ def _is_functional_failure(evidence: Evidence) -> bool:
     return isinstance(status, int) and status >= 400
 
 
+def _is_dependency_failure(evidence: Evidence) -> bool:
+    """True when health evidence reports a failed dependency.
+
+    A dependency outage is *not* a deployment regression, so the gate must
+    escalate rather than admit a rollback.  Only evidence that explicitly
+    reports ``dependencies_ok`` is considered; demo evidence omits the field and
+    is therefore unaffected.
+    """
+
+    if evidence.evidence_type is not EvidenceType.HEALTH:
+        return False
+    payload = evidence.payload or {}
+    return payload.get("dependencies_ok") is False
+
+
 def _is_deployment_evidence(evidence: Evidence) -> bool:
     if evidence.evidence_type is not EvidenceType.DEPLOYMENT:
         return False
@@ -118,8 +133,16 @@ def evaluate_diagnosis(
     epoch: int,
     evidence: list[Evidence],
     snapshot,
+    known_good_revision: str = INVESTIGATION_KNOWN_GOOD_TARGET,
+    broken_revision: str = INVESTIGATION_BROKEN_REVISION,
 ) -> GateDecision:
-    """Deterministic proposal gate; model confidence is irrelevant."""
+    """Deterministic proposal gate; model confidence is irrelevant.
+
+    ``known_good_revision``/``broken_revision`` default to the demo pair so the
+    demo gate is unchanged; the isolated staging adapter supplies its own fixed
+    revisions.  Everything else (evidence identity, generation match, recorded
+    predecessor, and a proposed rollback) is unchanged.
+    """
 
     same_incident = [e for e in evidence if e.incident_id == incident_id]
     scoped = [e for e in same_incident if e.epoch == epoch]
@@ -141,6 +164,10 @@ def evaluate_diagnosis(
     if not any(_is_functional_failure(e) for e in cited):
         return GateDecision(False, "no_functional_failure")
 
+    if any(_is_dependency_failure(e) for e in cited):
+        # A healthy binary cannot repair a failed dependency; never roll back.
+        return GateDecision(False, "dependencies_unhealthy")
+
     deployments = [e for e in cited if _is_deployment_evidence(e)]
     if not deployments:
         return GateDecision(False, "insufficient_evidence")
@@ -155,8 +182,8 @@ def evaluate_diagnosis(
     if not diagnosis.proposed_rollback:
         return GateDecision(False, "no_recovery_proposed")
     if (
-        snapshot.revision != INVESTIGATION_BROKEN_REVISION
-        or snapshot.predecessor != INVESTIGATION_KNOWN_GOOD_TARGET
+        snapshot.revision != broken_revision
+        or snapshot.predecessor != known_good_revision
     ):
         return GateDecision(False, "not_known_good_predecessor")
 
@@ -179,6 +206,9 @@ class InvestigationAgent:
         max_seconds: float = INVESTIGATION_MAX_SECONDS,
         provider_timeout: float = 20.0,
         lease_seconds: int = 180,
+        service_id: str = SERVICE_ID,
+        known_good_revision: str = INVESTIGATION_KNOWN_GOOD_TARGET,
+        broken_revision: str = INVESTIGATION_BROKEN_REVISION,
     ) -> None:
         self._repo = repo
         self._tools = tools
@@ -186,6 +216,9 @@ class InvestigationAgent:
         self._worker_id = worker_id
         self._clock = clock
         self._sleep = sleep or asyncio.sleep
+        self._service_id = service_id
+        self._known_good_revision = known_good_revision
+        self._broken_revision = broken_revision
         # Server-enforced maxima: configured values may be lower but never higher.
         self._max_tool_calls = min(int(max_tool_calls), INVESTIGATION_MAX_TOOL_CALLS)
         self._max_seconds = min(float(max_seconds), INVESTIGATION_MAX_SECONDS)
@@ -319,7 +352,7 @@ class InvestigationAgent:
         steps = await self._repo.list_investigation_steps(incident_id, run.epoch)
         return InvestigationContext(
             incident_id=incident_id,
-            service_id=SERVICE_ID,
+            service_id=self._service_id,
             epoch=run.epoch,
             step=len(steps),
             tool_calls_used=run.tool_calls,
@@ -332,7 +365,7 @@ class InvestigationAgent:
     async def _decide(
         self, incident_id: UUID, run: InvestigationRun, diagnosis: Diagnosis
     ) -> InvestigationOutcome:
-        snapshot = await self._repo.get_deployment_snapshot()
+        snapshot = await self._repo.get_deployment_snapshot(service_id=self._service_id)
         evidence = await self._repo.list_evidence(incident_id)
         decision = evaluate_diagnosis(
             diagnosis,
@@ -340,6 +373,8 @@ class InvestigationAgent:
             epoch=run.epoch,
             evidence=evidence,
             snapshot=snapshot,
+            known_good_revision=self._known_good_revision,
+            broken_revision=self._broken_revision,
         )
         if not decision.allowed:
             try:

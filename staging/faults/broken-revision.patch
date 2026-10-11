@@ -1,0 +1,17 @@
+diff --git a/internal/httpx/handlers_projects.go b/internal/httpx/handlers_projects.go
+index e2d7772..c02733f 100644
+--- a/internal/httpx/handlers_projects.go
++++ b/internal/httpx/handlers_projects.go
+@@ -114,6 +114,12 @@ func (d Deps) handleCreateProject(w http.ResponseWriter, r *http.Request) {
+ func (d Deps) handleListProjects(w http.ResponseWriter, r *http.Request) {
+ 	auth := authorizedFrom(r)
+ 
++	// Injected staging fault (broken revision): the authenticated tenant project
++	// listing fails. This is a deliberate, labelled staging fault, never an
++	// upstream regression, and it is applied only to the isolated faulty build.
++	httperr.Write(w, r, http.StatusInternalServerError, "injected_fault", "broken revision: project listing unavailable")
++	return
++
+ 	limit, rawCursor, err := pageParams(r)
+ 	if err != nil {
+ 		httperr.Fail(w, r, d.Log, err)

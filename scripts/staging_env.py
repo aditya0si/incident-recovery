@@ -23,9 +23,43 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ENV = REPO_ROOT / "staging" / ".env"
+CONTROL_ENV = REPO_ROOT / "staging" / ".control.env"
 EXAMPLE = REPO_ROOT / "staging" / ".env.example"
 
 PINNED_SHORT_SHA = "a6f715a"
+
+# --- Task 3: isolated recovery control-plane configuration -------------------
+#
+# These values live in their own gitignored file so the Task 1 workload
+# credentials are never regenerated or disturbed.  The control plane runs on its
+# own PostgreSQL server (control-postgres) so workload dependency outages do not
+# take the incident store with them.
+
+CONTROL_KEYS = (
+    "STAGING_CONTROL_DB_USER",
+    "STAGING_CONTROL_DB",
+    "STAGING_CONTROL_DB_PASSWORD",
+    "STAGING_OPERATOR_TOKEN",
+    "STAGING_INTERNAL_TOKEN",
+    "STAGING_CONTROL_DB_PORT",
+    "STAGING_CONTROL_API_PORT",
+)
+
+CONTROL_SECRET_KEYS = (
+    "STAGING_CONTROL_DB_PASSWORD",
+    "STAGING_OPERATOR_TOKEN",
+    "STAGING_INTERNAL_TOKEN",
+)
+
+CONTROL_PORT_KEYS = (
+    "STAGING_CONTROL_DB_PORT",
+    "STAGING_CONTROL_API_PORT",
+)
+
+PREFERRED_CONTROL_PORTS = {
+    "STAGING_CONTROL_DB_PORT": 18094,
+    "STAGING_CONTROL_API_PORT": 18095,
+}
 
 REQUIRED_KEYS = (
     "STAGING_OWNER_USER",
@@ -182,17 +216,115 @@ def ensure_env(path: Path = DEFAULT_ENV, *, force: bool = False, probe: bool = T
     return values
 
 
+def generate_control_values(probe: bool = True, taken: set[int] | None = None) -> dict[str, str]:
+    values: dict[str, str] = {
+        "STAGING_CONTROL_DB_USER": "control_owner",
+        "STAGING_CONTROL_DB": "incident_recovery_control",
+        "STAGING_CONTROL_DB_PASSWORD": secrets.token_hex(24),
+        "STAGING_OPERATOR_TOKEN": secrets.token_hex(24),
+        "STAGING_INTERNAL_TOKEN": secrets.token_hex(24),
+    }
+    used = set(taken or set())
+    for key in CONTROL_PORT_KEYS:
+        preferred = PREFERRED_CONTROL_PORTS[key]
+        chosen = allocate_loopback_port(preferred, used) if probe else preferred
+        values[key] = str(chosen)
+        used.add(chosen)
+    return values
+
+
+def validate_control_values(values: dict[str, str]) -> list[str]:
+    problems: list[str] = []
+    for key in CONTROL_KEYS:
+        raw = (values.get(key) or "").strip()
+        if not raw:
+            problems.append(f"{key} is missing or empty")
+        elif raw.lower().startswith(PLACEHOLDER_PREFIX):
+            problems.append(f"{key} is still a placeholder")
+    for key in CONTROL_SECRET_KEYS:
+        raw = (values.get(key) or "").strip()
+        if raw in FORBIDDEN_SECRETS or raw.lower() in FORBIDDEN_SECRETS:
+            problems.append(f"{key} is a development credential")
+    if (values.get("STAGING_CONTROL_DB") or "").strip() == "tenant_platform":
+        problems.append("STAGING_CONTROL_DB must not reuse the workload database name")
+    for key in CONTROL_PORT_KEYS:
+        raw = (values.get(key) or "").strip()
+        if not raw.isdigit() or not 1 <= int(raw) <= 65535:
+            problems.append(f"{key} must be a TCP port between 1 and 65535")
+    return problems
+
+
+def write_control_env(path: Path, values: dict[str, str]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "# Generated staging recovery control-plane configuration. GITIGNORED.",
+        "# Produced by scripts/staging_env.py --control; distinct from workload creds.",
+    ]
+    for key in CONTROL_KEYS:
+        lines.append(f"{key}={values[key]}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def ensure_control_env(
+    path: Path = CONTROL_ENV, *, force: bool = False, probe: bool = True
+) -> dict[str, str]:
+    existing = load_env_file(path)
+    if existing and not force:
+        problems = validate_control_values(existing)
+        if problems:
+            raise RuntimeError(f"{path} is present but invalid: " + "; ".join(problems))
+        return existing
+    values = generate_control_values(probe=probe)
+    problems = validate_control_values(values)
+    if problems:
+        raise RuntimeError("generated control config is invalid: " + "; ".join(problems))
+    write_control_env(path, values)
+    return values
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env", type=Path, default=DEFAULT_ENV)
     parser.add_argument("--check", action="store_true", help="validate only, do not write")
     parser.add_argument("--force", action="store_true", help="regenerate over an existing file")
     parser.add_argument(
+        "--control",
+        action="store_true",
+        help="generate/validate the recovery control-plane env (staging/.control.env)",
+    )
+    parser.add_argument(
         "--no-probe",
         action="store_true",
         help="do not probe loopback ports (used only for offline config tests)",
     )
     args = parser.parse_args(argv)
+
+    if args.control:
+        try:
+            if args.check:
+                values = load_env_file(CONTROL_ENV)
+                if not values:
+                    print(f"error: {CONTROL_ENV} does not exist", file=sys.stderr)
+                    return 1
+                problems = validate_control_values(values)
+                if problems:
+                    for problem in problems:
+                        print(f"error: {problem}", file=sys.stderr)
+                    return 1
+            else:
+                values = ensure_control_env(force=args.force, probe=not args.no_probe)
+        except RuntimeError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(f"config: {CONTROL_ENV}")
+        for key in CONTROL_KEYS:
+            shown = "[set]" if (values.get(key) or "").strip() else "[missing]"
+            if key in CONTROL_SECRET_KEYS:
+                print(f"  {key}: {shown}")
+            else:
+                print(f"  {key}: {values.get(key)}")
+        return 0
 
     try:
         if args.check:

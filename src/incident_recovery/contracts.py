@@ -23,15 +23,23 @@ REVISIONS: tuple[str, ...] = ("healthy-v1", "broken-v2")
 
 
 class DeploymentSnapshot(BaseModel):
-    """Authoritative active deployment state read from PostgreSQL."""
+    """Authoritative active deployment state read from PostgreSQL.
+
+    ``revision`` is an unconstrained string at the persistence boundary because
+    the same snapshot type carries the demo revisions *and* the isolated staging
+    revisions; the closed revision set is enforced by the bound
+    :class:`~incident_recovery.service_profile.ServiceProfile` at the gateway
+    switch and by the validated :class:`SwitchRequest` input (which stays a
+    demo literal).
+    """
 
     model_config = ConfigDict(frozen=True)
 
     service_id: str
-    revision: Revision
+    revision: str = Field(min_length=1)
     generation: int = Field(ge=1)
     activated_at: datetime
-    predecessor: Optional[Revision] = None
+    predecessor: Optional[str] = None
 
 
 class SwitchRequest(BaseModel):
@@ -65,7 +73,7 @@ class OperationRecord(BaseModel):
     operation_id: UUID
     service_id: str
     expected_generation: int
-    target_revision: Revision
+    target_revision: str = Field(min_length=1)
     snapshot: DeploymentSnapshot
     scope: Optional[str] = None
 
