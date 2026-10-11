@@ -234,9 +234,15 @@ def _pytest_gate(counts: dict) -> tuple[bool, str]:
 
 
 def _vitest_counts(output: str) -> dict:
+    """Parse the vitest ``Tests`` summary line (not the ``Test Files`` line)."""
+
     counts: dict[str, int] = {}
-    for label in ("passed", "failed", "skipped"):
-        match = re.search(rf"(\d+)\s+{label}\b", output)
+    summary = re.search(r"^\s*Tests\s+(.+)$", output, re.MULTILINE)
+    if summary is None:
+        return counts
+    line = summary.group(1)
+    for label in ("passed", "failed", "skipped", "todo"):
+        match = re.search(rf"(\d+)\s+{label}\b", line)
         if match:
             counts[label] = int(match.group(1))
     return counts

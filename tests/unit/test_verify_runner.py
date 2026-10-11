@@ -48,14 +48,29 @@ def test_pytest_gate_accepts_real_passing_run() -> None:
     assert "38" in detail
 
 
+_VITEST_OUTPUT = """
+ Test Files  5 passed (5)
+      Tests  31 passed (31)
+   Duration  2.34s
+"""
+
+
+def test_vitest_counts_parses_tests_line_not_files_line() -> None:
+    counts = verify._vitest_counts(_VITEST_OUTPUT)
+    assert counts["passed"] == 31
+
+
 def test_vitest_gate_rejects_zero_skipped_and_failing() -> None:
-    assert verify._test_gate(verify._vitest_counts("Tests  0 passed (0)"))[0] is False
-    assert verify._test_gate(verify._vitest_counts("Tests  2 skipped (2)"))[0] is False
-    assert verify._test_gate(verify._vitest_counts("Tests  1 failed | 30 passed (31)"))[0] is False
+    assert verify._test_gate(verify._vitest_counts("      Tests  0 passed (0)"))[0] is False
+    assert verify._test_gate(verify._vitest_counts("      Tests  2 skipped (2)"))[0] is False
+    assert (
+        verify._test_gate(verify._vitest_counts("      Tests  1 failed | 30 passed (31)"))[0]
+        is False
+    )
 
 
 def test_vitest_gate_accepts_real_passing_run() -> None:
-    counts = verify._vitest_counts("Tests  31 passed (31)")
+    counts = verify._vitest_counts(_VITEST_OUTPUT)
     ok, detail = verify._test_gate(counts)
     assert ok is True
     assert "31" in detail
