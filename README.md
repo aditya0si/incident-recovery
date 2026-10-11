@@ -5,12 +5,34 @@ switches real HTTP traffic between a predefined healthy and broken version, with
 a durable incident workflow, operator control surface, and approval-gated,
 independently verified rollback.
 
-**Milestones 1–4.** This repository implements the real demo deployment slice
+**Milestones 1–5.** This repository implements the real demo deployment slice
 (Task 1), the durable incident workflow plus operator API (Task 2),
 approval-gated rollback with durable recovery and sustained functional
-verification (Task 3), and the bounded, evidence-backed investigation agent
-(Task 4). The console (Task 5) is a later milestone and is **not** implemented
-here.
+verification (Task 3), the bounded, evidence-backed investigation agent
+(Task 4), and the operator console (Task 5).
+
+## Operator console
+
+The console is a React/TypeScript/Vite app served by nginx at
+**http://127.0.0.1:18083** (loopback only). nginx also acts as the same-origin
+reverse proxy for the operator API and the resumable SSE event stream, so the
+browser only ever talks to the console origin.
+
+- The operator enters the bearer token in the UI; it is held **only in memory**
+  for that tab (never `localStorage`, `sessionStorage`, cookies, the URL, logs,
+  or build output).
+- The queue shows persisted incidents with status and update time; the detail
+  panel shows the recorded investigation identity (prominently labeling
+  `scripted:demo` or `missing-credentials`), the evidence-linked diagnosis, the
+  actual bounded tool trace, the active deployment revision/generation, the
+  proposal's current/target revisions and five-minute approval TTL, and the
+  recovery operation's **executed vs verified** distinction.
+- Approve binds the exact proposal digest; in-flight and stale/expired approvals
+  are disabled and the server's refusal is shown. Reject never executes an
+  action. There is no proposal-injection endpoint.
+- Rendered logs, model text, and payloads are untrusted and rendered as inert
+  text (React escaping plus a restrictive Content-Security-Policy); no HTML/script
+  injection is possible.
 
 ## Architecture
 
@@ -18,6 +40,7 @@ here.
                  host 127.0.0.1
    public  :18080 ──► gateway (proxy)  ──demo_net──► demo-healthy-v1 / broken-v2
    api     :18082 ──► api ──internal_net──► postgres
+   console :18083 ──► console (nginx) ──internal_net──► api  (same-origin proxy)
    postgres:15432 ──────────────────────────┘
                         api ──internal_net──► gateway-control (no host port)
                       worker ──internal_net──► executor (no host port)
@@ -25,6 +48,10 @@ here.
                         └──────────► gateway (verification) ◄── gateway-control
 ```
 
+- `console`: static React bundle served by nginx. It serves the app and proxies
+  the operator API and SSE stream same-origin to `api`; it never reaches the
+  internal executor or `gateway-control` and holds no Docker socket. Published on
+  loopback only.
 - `gateway` (proxy role): public listener. Proxies fixed functional paths to the
   active demo deployment chosen from PostgreSQL. It has **no** switch route.
 - `gateway-control` (control role): authenticated, reservation-gated
@@ -190,6 +217,7 @@ Ports (all loopback-only):
 | --------------- | ------- | -------------------------------- |
 | `GATEWAY_PORT`  | 18080   | public gateway                   |
 | `API_PORT`      | 18082   | operator HTTP API                |
+| `CONSOLE_PORT`  | 18083   | operator console (http://127.0.0.1:18083) |
 | `CONTROL_PORT`  | 18081   | internal switch (test override only) |
 | `POSTGRES_PORT` | 15432   | PostgreSQL (host test access)    |
 
@@ -203,10 +231,16 @@ uv run pytest tests/unit -v                        # unit tests (no Docker)
 docker compose -p incident-recovery config -q      # validate config quietly
 docker compose -p incident-recovery up --build -d --wait
 uv run pytest tests/integration -v                 # real PostgreSQL integration
+
+# frontend unit tests, typecheck, and production build (Node 22+)
+npm --prefix frontend ci
+npm --prefix frontend test -- --run
+npm --prefix frontend run build
 ```
 
-`tests/conftest.py` loads `.env`, so token-based tests pick up values without
-exporting them manually.
+Open **http://127.0.0.1:18083** in a browser and paste the operator token to use
+the console. `tests/conftest.py` loads `.env`, so token-based tests pick up
+values without exporting them manually.
 
 Stop the stack without deleting unrelated resources:
 
@@ -252,6 +286,24 @@ live API and asserts sustained checks; it briefly stops and restarts the real
 health/logs/metrics/deployments tools to a gated proposal, then through the real
 approval and sustained-verification path. Scripted runs are recorded with the
 `scripted:demo` adapter identity.
+
+### Console browser E2E (Playwright)
+
+`tests/e2e/test_console.py` drives the real console in a real Chromium browser
+against the live stack: it injects the demo fault and submits an alert from the
+UI, waits for the real diagnosis, approves the exact digest in the UI, and
+asserts the real sustained recovery. It also covers a **real escalation**
+(scripted investigation against a healthy deployment), a **real operator
+rejection**, a `recovery_failed` view backed by a clearly labeled test-side
+fixture, and a narrow-viewport/accessibility check. Playwright's browser is
+installed separately:
+
+```bash
+uv run playwright install chromium
+docker compose -p incident-recovery -f compose.yaml -f compose.investigation.yaml up --build -d --wait
+uv run pytest tests/e2e/test_console.py -v
+docker compose -p incident-recovery up --build -d --wait   # restore default
+```
 
 ## Operator API demonstration
 
@@ -328,20 +380,23 @@ curl -s -X POST http://127.0.0.1:18082/incidents/<incident-id>/reject \
 
 Approval moves the incident to `recovering` and creates one operation. The
 `worker` executes it via the `executor` and then verifies sustained functional
-recovery through the public gateway; `GET /incidents/{id}` returns the
-proposal/approval/operation/verification needed by the future console.
+recovery through the public gateway. The same state is shown in the console at
+http://127.0.0.1:18083.
 
 ## Scope and limitations
 
 - Local Docker only; no Kubernetes, cloud deployment, or publishing.
+- The console is a static SPA served by nginx plus a narrow same-origin API/SSE
+  proxy. It reads and writes only through the real persisted API and renders all
+  untrusted text as inert text; it is not a generic chat UI.
 - No Docker socket is mounted in any container. The executor is an internal,
   authenticated, fixed-operation surface and deliberately has no Docker power
   (see `docs/security.md`); container restart is deferred to a later milestone.
 - The broken revision is a predefined demo fault; it is not a production
   control surface.
-- Task 4 runs bounded, evidence-backed investigation with real observations and a
-  deterministic proposal gate. It does **not** provide the console (Task 5); the
-  operator inspects incidents over `GET /incidents/{id}` until then.
+- Task 5 provides the operator console. All normal UI data comes from the real
+  persisted API; no seeded fake dashboards are used. The single test-side fixture
+  is a labeled `recovery_failed` row used only by the browser E2E failure view.
 - Live-model investigation is **blocked** without a separately configured
   OpenAI-compatible runtime model. The default stack therefore escalates
   investigations (`adapter=missing-credentials`) rather than fabricating a

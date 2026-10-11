@@ -108,7 +108,10 @@ services:
       OPERATOR_TOKEN: ${OPERATOR_TOKEN}
       INTERNAL_TOKEN: ${INTERNAL_TOKEN}
       GATEWAY_INTERNAL_URL: http://gateway-control:8000
-      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://127.0.0.1:5173,http://localhost:5173}
+      # The explicit browser-origin allowlist. The console origin is appended so
+      # the loopback console can perform authenticated writes; it can never be an
+      # arbitrary public origin because the ports bind to 127.0.0.1 only.
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://127.0.0.1:5173,http://localhost:5173},http://127.0.0.1:${CONSOLE_PORT:-18083},http://localhost:${CONSOLE_PORT:-18083}
     ports:
       - "127.0.0.1:${API_PORT}:8000"
     networks:
@@ -119,6 +122,28 @@ services:
       gateway-control:
         condition: service_healthy
     healthcheck: *healthz-check
+
+  # Operator console: static React bundle served by nginx, which also proxies the
+  # operator API and SSE stream same-origin. Published on loopback only; it never
+  # reaches the internal executor or gateway-control and holds no Docker socket.
+  console:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.console
+    image: incident-recovery-console:local
+    ports:
+      - "127.0.0.1:${CONSOLE_PORT:-18083}:80"
+    networks:
+      - internal_net
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+      start_period: 5s
 
   # Restricted internal executor. It accepts only a persisted operation id over
   # an authenticated internal channel and drives the fixed desired-state switch.

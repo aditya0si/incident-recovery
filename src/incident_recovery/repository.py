@@ -1249,6 +1249,18 @@ class IncidentRepository:
         )
         return _row_to_investigation_run(row) if row else None
 
+    async def get_latest_investigation_run(
+        self, incident_id: UUID
+    ) -> Optional[InvestigationRun]:
+        """Most recent investigation run for an incident (read-only console view)."""
+        row = await self.pool.fetchrow(
+            "SELECT incident_id, epoch, adapter, state, tool_calls, started_at, "
+            "deadline_at, updated_at, last_error FROM investigation_runs "
+            "WHERE incident_id = $1 ORDER BY epoch DESC LIMIT 1",
+            incident_id,
+        )
+        return _row_to_investigation_run(row) if row else None
+
     async def set_investigation_run_state(
         self,
         incident_id: UUID,

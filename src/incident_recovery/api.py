@@ -45,6 +45,9 @@ from .contracts import (
     FaultResult,
     IncidentDetail,
     IncidentSummary,
+    InvestigationRunView,
+    InvestigationStepView,
+    InvestigationView,
     OperationView,
     ProposalView,
     RejectionRequest,
@@ -180,6 +183,35 @@ def _verification_view(operation: Optional[Operation]) -> Optional[VerificationV
     )
 
 
+def _investigation_view(run, steps) -> InvestigationView:
+    """Read-only investigation identity + bounded tool trace for the console."""
+
+    return InvestigationView(
+        run=InvestigationRunView(
+            incident_id=run.incident_id,
+            epoch=run.epoch,
+            adapter=run.adapter,
+            state=run.state,
+            tool_calls=run.tool_calls,
+            started_at=run.started_at,
+            deadline_at=run.deadline_at,
+            updated_at=run.updated_at,
+            last_error=run.last_error,
+        ),
+        steps=[
+            InvestigationStepView(
+                id=step.id,
+                epoch=step.epoch,
+                step_index=step.step_index,
+                kind=step.kind,
+                payload=step.payload,
+                created_at=step.created_at,
+            )
+            for step in steps
+        ],
+    )
+
+
 def _sse_frame(event: Event) -> str:
     data = _event_view(event).model_dump(mode="json")
     return f"id: {event.id}\ndata: {json.dumps(data, separators=(',', ':'))}\n\n"
@@ -232,6 +264,12 @@ def create_app(
             content=body.model_dump(mode="json"),
         )
 
+    @app.get("/deployment")
+    async def get_deployment() -> dict:
+        # Authoritative active deployment state (read-only) for the console.
+        snapshot = await store.get_snapshot()
+        return snapshot.model_dump(mode="json")
+
     @app.get("/incidents")
     async def list_incidents(
         limit: int = Query(default=50, ge=1, le=200),
@@ -250,6 +288,10 @@ def create_app(
         proposal = await repo.get_proposal_for_incident(incident_id)
         approval = await repo.get_approval_for_incident(incident_id)
         operation = await repo.get_operation_for_incident(incident_id)
+        run = await repo.get_latest_investigation_run(incident_id)
+        steps = (
+            await repo.list_investigation_steps(incident_id, run.epoch) if run else []
+        )
         detail = IncidentDetail(
             **_incident_summary(incident).model_dump(),
             evidence=[_evidence_view(e) for e in evidence],
@@ -258,6 +300,7 @@ def create_app(
             approval=approval_view(approval) if approval else None,
             operation=operation_view(operation) if operation else None,
             verification=_verification_view(operation) if operation else None,
+            investigation=_investigation_view(run, steps[-200:]) if run else None,
         )
         return detail.model_dump(mode="json")
 

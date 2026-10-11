@@ -274,6 +274,47 @@ class ExecuteResponse(BaseModel):
     operation: OperationView
 
 
+class InvestigationRunView(BaseModel):
+    """Recorded investigation identity and budget for the console.
+
+    The adapter identity is surfaced verbatim so a scripted run is always shown
+    as ``scripted:demo`` and an unavailable runtime model as
+    ``missing-credentials``; it is never relabeled as a live model.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    incident_id: UUID
+    epoch: int
+    adapter: str
+    state: str
+    tool_calls: int
+    started_at: datetime
+    deadline_at: datetime
+    updated_at: datetime
+    last_error: Optional[str] = None
+
+
+class InvestigationStepView(BaseModel):
+    """A bounded logical investigation step (actual tool trace)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    id: int
+    epoch: int
+    step_index: int
+    kind: str
+    payload: Dict[str, Any]
+    created_at: datetime
+
+
+class InvestigationView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    run: Optional[InvestigationRunView] = None
+    steps: List[InvestigationStepView] = Field(default_factory=list)
+
+
 class IncidentDetail(IncidentSummary):
     model_config = ConfigDict(frozen=True)
 
@@ -283,6 +324,7 @@ class IncidentDetail(IncidentSummary):
     approval: Optional[ApprovalView] = None
     operation: Optional[OperationView] = None
     verification: Optional[VerificationView] = None
+    investigation: Optional[InvestigationView] = None
 
 
 def operation_view(operation) -> OperationView:

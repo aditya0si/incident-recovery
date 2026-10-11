@@ -1,4 +1,4 @@
-# Security model and trust boundaries (Milestones 1–4)
+# Security model and trust boundaries (Milestones 1–5)
 
 ## Network and credential boundaries
 
@@ -106,3 +106,32 @@ The investigation agent is deliberately the least-privileged component:
   It never reads OpenCode auth or Hermes secrets. Missing credentials fail closed
   to escalation; the `scripted:demo` adapter is enabled only by the explicit
   `INVESTIGATION_ADAPTER=scripted` opt-in and every run records its identity.
+
+## Operator console boundary (Milestone 5)
+
+- **Single browser origin.** The console is the only browser-facing origin
+  (loopback `:18083`). nginx serves the static bundle and reverse-proxies exactly
+  the operator API prefixes (`/incidents`, `/alerts`, `/demo`, `/deployment`,
+  `/healthz`) to the internal `api` service. It does **not** proxy
+  `gateway-control` or the `executor`; unknown paths return 404 rather than an
+  `index.html` fallback, and the console holds no Docker socket.
+- **Explicit origin allowlist.** The API's browser-origin allowlist is the fixed
+  `ALLOWED_ORIGINS` value plus the loopback console origin. A write with any other
+  `Origin` is refused with 403 even when a valid token is supplied, and all ports
+  bind to `127.0.0.1` only.
+- **Token in memory only.** The operator token is entered at runtime and held in
+  an in-memory closure for the tab. It is never written to `localStorage`,
+  `sessionStorage`, cookies, the URL, logs, screenshots, or build output, and it
+  is sent only as an `Authorization: Bearer` header.
+- **Inert untrusted rendering.** Persisted logs, model text, and evidence/model
+  payloads are untrusted and rendered as text (React escaping); the console never
+  uses `dangerouslySetInnerHTML`. A restrictive Content-Security-Policy
+  (`script-src 'self'`, `frame-ancestors 'none'`, `base-uri 'none'`) plus
+  `X-Content-Type-Options` / `X-Frame-Options` further blocks HTML/script
+  injection and framing.
+- **No new write surface.** The console adds only read-only API views
+  (`GET /deployment` and the investigation identity/tool-trace fields on
+  `GET /incidents/{id}`). Approve still binds the exact proposal digest and the
+  server re-validates generation and TTL; there is no proposal-injection path, and
+  the in-flight/stale/expired controls only disable client intent — the server
+  refusal is authoritative.
