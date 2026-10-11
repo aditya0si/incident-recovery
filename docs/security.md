@@ -147,6 +147,13 @@ The investigation agent is deliberately the least-privileged component:
   compromised workload are deterministically bounded below the evidence size cap
   and secret-shaped values are redacted before persistence, so an oversized log
   list or a single huge field cannot grow the store or derail the loop.
+  Redaction is structural for JSON: a complete JSON object/array (or a complete
+  object fragment embedded in surrounding text) is decoded and a secret-shaped
+  key's **entire** value — scalar, list, or nested object — is replaced, at both
+  the tool-observation sink and the repository text-column (`last_error`) sink.
+  Ordinary JSON with no secret-shaped field is preserved verbatim, and a
+  container that cannot be parsed safely is over-redacted to the end of the
+  fragment. This is best-effort redaction, **not** a DLP guarantee.
 - **Fail-closed recovery admission.** A recovery admission is re-validated at the
   authoritative switch (fixed service, revision/generation, known-good target,
   TTL, single consumption); an approval that expired during admission, a stale

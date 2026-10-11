@@ -322,6 +322,136 @@ def test_tool_runner_logs_redacts_quoted_trailing_words() -> None:
     asyncio.run(run())
 
 
+# --- Round 3: structural JSON container secret values ------------------------
+#
+# The round-3 probe shapes, reproduced verbatim.  ``redact_secrets`` on a
+# JSON-encoded string must structurally redact a secret key's *entire* value,
+# whatever its type (scalar, list, or nested object), rather than matching the
+# single opening bracket of a container and leaking the elements after it.
+
+_ROUND3_JSON_SENTINEL = "SYNTHETIC alpha beta"
+_ROUND3_SECOND_SENTINEL = "SECOND_SENTINEL"
+
+
+def test_redact_secrets_redacts_json_list_valued_secret() -> None:
+    """The exact reported defect: a list-valued secret leaked both elements."""
+
+    text = json.dumps({"password": [_ROUND3_JSON_SENTINEL, _ROUND3_SECOND_SENTINEL]})
+    result = redact_secrets(text)
+    assert _ROUND3_JSON_SENTINEL not in result
+    assert _ROUND3_SECOND_SENTINEL not in result
+    assert "[REDACTED]" in result
+    assert "password" in result
+
+
+def test_redact_secrets_redacts_json_object_valued_secret() -> None:
+    text = json.dumps({"password": {"value": _ROUND3_JSON_SENTINEL}})
+    result = redact_secrets(text)
+    assert _ROUND3_JSON_SENTINEL not in result
+    assert "[REDACTED]" in result
+
+
+def test_redact_structure_redacts_container_valued_secret_keys() -> None:
+    payload = {
+        "password": [_ROUND3_JSON_SENTINEL, _ROUND3_SECOND_SENTINEL],
+        "token": {"nested": [_ROUND3_JSON_SENTINEL]},
+        "note": "safe",
+    }
+    result = redact_structure(payload)
+    assert result["password"] == "[REDACTED]"
+    assert result["token"] == "[REDACTED]"
+    assert result["note"] == "safe"
+    blob = json.dumps(result)
+    assert _ROUND3_JSON_SENTINEL not in blob
+    assert _ROUND3_SECOND_SENTINEL not in blob
+
+
+def test_redact_secrets_redacts_nested_nonsensitive_containers() -> None:
+    text = json.dumps(
+        {
+            "config": {"database": {"password": [_ROUND3_JSON_SENTINEL, _ROUND3_SECOND_SENTINEL]}},
+            "ok": 1,
+        }
+    )
+    result = redact_secrets(text)
+    assert _ROUND3_JSON_SENTINEL not in result
+    assert _ROUND3_SECOND_SENTINEL not in result
+    reparsed = json.loads(result)
+    assert reparsed["config"]["database"]["password"] == "[REDACTED]"
+    assert reparsed["ok"] == 1
+
+
+def test_redact_secrets_redacts_json_fragment_with_prefix_and_suffix() -> None:
+    fragment = json.dumps({"password": [_ROUND3_JSON_SENTINEL, _ROUND3_SECOND_SENTINEL]})
+    text = "INFO payload=" + fragment + " done"
+    result = redact_secrets(text)
+    assert _ROUND3_JSON_SENTINEL not in result
+    assert _ROUND3_SECOND_SENTINEL not in result
+    assert result.startswith("INFO payload=")
+    assert result.endswith(" done")
+
+
+def test_redact_secrets_fails_closed_on_malformed_sensitive_container() -> None:
+    for text in (
+        'password: ["' + _ROUND3_JSON_SENTINEL + '", "' + _ROUND3_SECOND_SENTINEL + '"',
+        '{"password": ["' + _ROUND3_JSON_SENTINEL + '", "' + _ROUND3_SECOND_SENTINEL + '"',
+    ):
+        result = redact_secrets(text)
+        assert _ROUND3_JSON_SENTINEL not in result, text
+        assert _ROUND3_SECOND_SENTINEL not in result, text
+
+
+def test_redact_secrets_preserves_ordinary_json_control() -> None:
+    text = json.dumps({"count": 5, "revision": "broken-v2", "nested": {"ok": True}})
+    assert redact_secrets(text) == text
+    compact = json.dumps({"count": 5, "revision": "broken-v2"}, separators=(",", ":"))
+    assert redact_secrets(compact) == compact
+
+
+def test_redact_secrets_preserves_unicode_ordinary_json() -> None:
+    text = json.dumps({"note": "caf\u00e9 \U0001f600"}, ensure_ascii=False)
+    assert redact_secrets(text) == text
+
+
+def test_redact_secrets_redacts_error_render_with_json_container() -> None:
+    text = (
+        'rollback failed: {"password": ['
+        + json.dumps(_ROUND3_JSON_SENTINEL)
+        + ", "
+        + json.dumps(_ROUND3_SECOND_SENTINEL)
+        + "]}"
+    )
+    result = redact_secrets(text)
+    assert _ROUND3_JSON_SENTINEL not in result
+    assert _ROUND3_SECOND_SENTINEL not in result
+    assert result.startswith("rollback failed: ")
+
+
+def test_tool_runner_observe_logs_redacts_json_container_secret() -> None:
+    """The reproduced real sink: a JSON-encoded log line with a list secret."""
+
+    secret_line = json.dumps({"password": [_ROUND3_JSON_SENTINEL, _ROUND3_SECOND_SENTINEL]})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/logs"
+        return httpx.Response(200, json={"lines": [{"message": secret_line}]})
+
+    async def run() -> None:
+        client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://gateway.test"
+        )
+        runner = ToolRunner(repo=None, gateway_url="http://gateway.test", client=client)
+        try:
+            observation = await runner.observe(ToolRequest(tool="logs", lines=5))
+        finally:
+            await client.aclose()
+        blob = json.dumps(observation.summary)
+        assert _ROUND3_JSON_SENTINEL not in blob
+        assert _ROUND3_SECOND_SENTINEL not in blob
+
+    asyncio.run(run())
+
+
 def test_provider_errors_do_not_leak_api_key() -> None:
     from incident_recovery.model_adapter import OpenAICompatibleAdapter
     from incident_recovery.models import ModelUnavailable

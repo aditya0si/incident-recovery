@@ -692,3 +692,28 @@ async def test_set_investigation_run_state_redacts_last_error(
     assert reloaded is not None
     assert "SYNTHETIC_SENTINEL" not in (reloaded.last_error or "")
     assert "token" in (reloaded.last_error or "")
+
+
+async def test_set_investigation_run_state_redacts_json_container_last_error(
+    test_db: IntegrationDB,
+) -> None:
+    """Round 3: a JSON container in the ``last_error`` SQL parameter must not leak."""
+
+    repo = IncidentRepository(test_db.pool)
+    incident, _ = await repo.ingest_alert(
+        f"runjsonerr-{uuid.uuid4()}", "demo-api", "x", {}
+    )
+    await repo.claim_next_investigation("w1", lease_seconds=180, now=utcnow())
+    run = await repo.ensure_investigation_run(incident.id, "scripted:test", 120, now=utcnow())
+
+    last_error = json.dumps(
+        {"password": ["SYNTHETIC alpha beta", "SECOND_SENTINEL"]}
+    )
+    await repo.set_investigation_run_state(
+        incident.id, run.epoch, "escalated", last_error=last_error, now=utcnow()
+    )
+    reloaded = await repo.get_investigation_run(incident.id, run.epoch)
+    assert reloaded is not None
+    assert "SYNTHETIC alpha beta" not in (reloaded.last_error or "")
+    assert "SECOND_SENTINEL" not in (reloaded.last_error or "")
+    assert "password" in (reloaded.last_error or "")

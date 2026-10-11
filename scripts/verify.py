@@ -235,12 +235,20 @@ def _pytest_gate(counts: dict) -> tuple[bool, str]:
     errors = counts.get("error", 0)
     skipped = counts.get("skipped", 0)
     deselected = counts.get("deselected", 0)
+    xfailed = counts.get("xfailed", 0)
+    xpassed = counts.get("xpassed", 0)
     if failed or errors:
         return False, f"{failed + errors} failing/error test(s)"
     if skipped:
         return False, f"{skipped} skipped test(s)"
     if deselected:
         return False, f"{deselected} deselected/unexecuted test(s)"
+    # No required category is optional in v1: an expected-failure or an
+    # unexpected-pass means the suite did not cleanly execute, so it cannot pass.
+    if xfailed:
+        return False, f"{xfailed} xfailed/unexecuted test(s)"
+    if xpassed:
+        return False, f"{xpassed} xpassed/xfail-marked test(s)"
     if counts.get("no_tests_ran") or passed == 0:
         return False, "no tests executed"
     return True, f"{passed} passed"
@@ -282,9 +290,12 @@ def _test_gate(counts: dict) -> tuple[bool, str]:
     if todo:
         return False, f"{todo} todo/unexecuted test(s)"
     total = counts.get("total")
-    if total is not None and passed + failed + skipped + todo < total:
-        unexecuted = total - (passed + failed + skipped + todo)
-        return False, f"{unexecuted} unexecuted test(s) of {total}"
+    executed = passed + failed + skipped + todo
+    # The executed statuses must sum *exactly* to the reported total.  A `>=`
+    # check would accept a malformed summary (`Tests 2 passed (1)`), so require
+    # equality and fail on any over- or under-count.
+    if total is not None and executed != total:
+        return False, f"executed/total mismatch ({executed} of {total})"
     if passed == 0:
         return False, "no tests executed"
     return True, f"{passed} passed"

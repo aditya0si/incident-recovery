@@ -56,16 +56,32 @@ def _redact_assignment(match: "re.Match[str]") -> str:
     return f"{key}{key_quote}{separator}{marker}"
 
 
+def _redact_container(match: "re.Match[str]") -> str:
+    key, key_quote, separator = match.groups()
+    return f"{key}{key_quote}{separator}{_REDACTED}"
+
+
+# ``key``/``"key"`` followed by ``:`` or ``=`` and a value.  The container rule
+# runs first and consumes an entire ``{``/``[`` value conservatively: a secret
+# container cannot be bounded by pattern matching, so its whole remaining
+# fragment is redacted rather than leaking elements.  It never matches the
+# ``[REDACTED]`` marker itself, which keeps redaction idempotent.  The scalar
+# rule then keeps a quoted value's quotes so redacted JSON stays well-formed.
+# Scope: best-effort pattern redaction, not a DLP guarantee.
 _SECRET_PATTERNS = (
     (
         re.compile(r"(?i)(authorization\s*[:=]\s*(?:bearer|basic|token)\s+)\S+"),
         _redact_scheme,
     ),
     (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-]{6,}"), _redact_scheme),
-    # ``key``/``"key"`` followed by ``:`` or ``=`` and a quoted or bare value.
-    # The leading quote of a JSON key is outside the match, so ``"password": ...``
-    # is still recognised.  The value keeps its quotes so redacted JSON stays
-    # well-formed.  Scope: best-effort pattern redaction, not a DLP guarantee.
+    (
+        re.compile(
+            rf"(?i)({_SENSITIVE_KEY})([\"']?)(\s*[:=]\s*)"
+            rf"(?!{re.escape(_REDACTED)})(?:[\[{{]).*",
+            re.DOTALL,
+        ),
+        _redact_container,
+    ),
     (
         re.compile(
             rf"(?i)({_SENSITIVE_KEY})([\"']?)(\s*[:=]\s*)({_QUOTED_OR_BARE_VALUE})"
@@ -82,28 +98,30 @@ _SENSITIVE_ENV_VARS = (
 )
 
 
-def redact_secrets(text: str, *, extra: Iterable[str] = ()) -> str:
-    """Redact bearer/basic tokens, credential assignments, and known values.
+def _known_values(extra: Iterable[str]) -> list[str]:
+    values = list(extra)
+    for name in _SENSITIVE_ENV_VARS:
+        value = os.environ.get(name)
+        if value:
+            values.append(value)
+    return [value for value in values if value and len(value) >= 4]
 
-    Scope (best effort, **not** a DLP guarantee): it recognises bearer/basic/token
-    authorization headers, standalone bearer tokens, and ``key``/``"key"``
-    assignments for secret-shaped names followed by a quoted (spaces/escapes
-    allowed) or bare value, including JSON-encoded text and nested JSON/list
-    payloads embedded in a string.  It also replaces any configured secret value
-    verbatim.  It deliberately does **not** claim to catch arbitrary obfuscation.
+
+def _redact_text(text: str, *, extra: Iterable[str] = ()) -> str:
+    """Redact tokens and secret-shaped assignments in plain text only.
+
+    Pure text redaction: this never parses JSON, so it is safe to call from
+    :func:`redact_structure` without any recursive cycle.  A secret-shaped key
+    whose value opens a container (``key: {...}`` / ``key: [...]``) is redacted
+    conservatively to the end of the fragment, because an unparsed container
+    cannot be safely bounded by pattern matching.
     """
 
     redacted = text
     for pattern, repl in _SECRET_PATTERNS:
         redacted = pattern.sub(repl, redacted)
-    values = list(extra)
-    for name in _SENSITIVE_ENV_VARS:
-        value = os.environ.get(name)
-        if value and len(value) >= 4:
-            values.append(value)
-    for value in values:
-        if value and len(value) >= 4:
-            redacted = redacted.replace(value, _REDACTED)
+    for value in _known_values(extra):
+        redacted = redacted.replace(value, _REDACTED)
     return redacted
 
 
@@ -113,21 +131,108 @@ def _is_sensitive_key(key: str) -> bool:
     return re.search(_SENSITIVE_KEY, key, re.IGNORECASE) is not None
 
 
+def _redact_embedded(text: str, *, extra: Iterable[str] = ()) -> str:
+    """Structurally redact JSON object fragments embedded in ``text``.
+
+    Only complete objects whose first token is a key (or an empty ``{}``) are
+    attempted, so a run of bare ``{`` characters cannot trigger quadratic decode
+    attempts.  Fragments without a secret-shaped key are copied through verbatim,
+    which preserves ordinary log JSON formatting; the caller's final text pass
+    covers any non-JSON assignment syntax in the surrounding gaps.
+    """
+
+    decoder = json.JSONDecoder()
+    out: list[str] = []
+    i = 0
+    last = 0
+    n = len(text)
+    while i < n:
+        if text[i] == "{":
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j < n and text[j] in ('"', "}"):
+                try:
+                    obj, end = decoder.raw_decode(text, i)
+                except (ValueError, RecursionError):
+                    obj = None
+                    end = i
+                if isinstance(obj, dict):
+                    out.append(text[last:i])
+                    redacted = redact_structure(obj, extra=extra)
+                    out.append(
+                        text[i:end]
+                        if redacted == obj
+                        else json.dumps(redacted, ensure_ascii=False)
+                    )
+                    i = end
+                    last = end
+                    continue
+        i += 1
+    out.append(text[last:])
+    return "".join(out)
+
+
+def _redact_json_string(text: str, *, extra: Iterable[str] = ()) -> str:
+    """Redact a text string, parsing full or embedded JSON when safely possible.
+
+    A complete JSON object/array is decoded and passed through
+    :func:`redact_structure`; otherwise complete object fragments embedded in
+    surrounding text are redacted while their prefixes and suffixes are kept.
+    Text that cannot be parsed safely falls back to conservative text redaction,
+    which fails closed on an unterminated secret container rather than leaking
+    its content.  Ordinary JSON without a secret-shaped field is preserved
+    verbatim.
+    """
+
+    stripped = text.lstrip()
+    if stripped[:1] in ("{", "["):
+        try:
+            obj, end = json.JSONDecoder().raw_decode(stripped)
+        except (ValueError, RecursionError):
+            obj = None
+            end = 0
+        if isinstance(obj, (dict, list)) and not stripped[end:].strip():
+            redacted = redact_structure(obj, extra=extra)
+            if redacted != obj:
+                return _redact_text(json.dumps(redacted, ensure_ascii=False), extra=extra)
+            return text
+    return _redact_text(_redact_embedded(text, extra=extra), extra=extra)
+
+
+def redact_secrets(text: str, *, extra: Iterable[str] = ()) -> str:
+    """Redact bearer/basic tokens, credential assignments, and known values.
+
+    Scope (best effort, **not** a DLP guarantee): it recognises bearer/basic/token
+    authorization headers, standalone bearer tokens, and ``key``/``"key"``
+    assignments for secret-shaped names.  A secret-shaped key whose value is a
+    JSON container (list or nested object) has its **entire** value replaced,
+    whether the JSON is the whole string or a fragment embedded in surrounding
+    text.  A container that cannot be parsed safely is redacted conservatively to
+    the end of the fragment.  Ordinary JSON with no secret-shaped field is
+    preserved verbatim, and configured secret values are replaced verbatim.  It
+    deliberately does **not** claim to catch arbitrary obfuscation.
+    """
+
+    return _redact_json_string(text, extra=extra)
+
+
 def redact_structure(value, *, extra: Iterable[str] = ()):
     """Recursively redact secret-shaped keys and secret values in a JSON tree.
 
     A mapping key that names a secret (``password``, ``api_key``, ``token``, ...)
     has its *entire* value replaced by the redaction marker, whatever the value
-    type.  String values and keys are additionally passed through
-    :func:`redact_secrets` so assignment-like text and configured secret values
-    are removed too.  Lists and nested mappings are walked recursively; other
-    scalars are preserved.  The input is never mutated.
+    type (scalar, list, or nested mapping).  String values and keys are
+    additionally passed through :func:`_redact_json_string` so assignment-like
+    text, embedded JSON fragments, and configured secret values are removed too.
+    Lists and nested mappings are walked recursively; other scalars are
+    preserved.  The input is never mutated.
     """
 
     if isinstance(value, dict):
         cleaned: dict = {}
         for key, item in value.items():
-            key_text = redact_secrets(str(key), extra=extra)
+            key_text = _redact_text(str(key), extra=extra)
             if _is_sensitive_key(str(key)):
                 cleaned[key_text] = _REDACTED
             else:
@@ -136,7 +241,7 @@ def redact_structure(value, *, extra: Iterable[str] = ()):
     if isinstance(value, (list, tuple)):
         return [redact_structure(item, extra=extra) for item in value]
     if isinstance(value, str):
-        return redact_secrets(value, extra=extra)
+        return _redact_json_string(value, extra=extra)
     return value
 
 

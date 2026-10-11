@@ -308,3 +308,86 @@ tests as well as skips. A genuinely clean `31 passed (31)` still passes.
   `test_pytest_gate_rejects_deselected_tests`).
 - GREEN: `tests/unit/test_verify_runner.py` `13 passed`.
 
+# Round 3 — third adversarial repair (structural JSON containers, gate totals)
+
+The parent independently reproduced two further gaps against the committed
+`0dbe0b2` source and reran the reviewer probes. As before, every new test was
+written first and run against the pre-fix source (RED), then against the fixed
+source (GREEN); no count or status is invented and no test was relaxed.
+
+| # | Severity | Defect | Regression test(s) |
+| --- | --- | --- | --- |
+| 1 | MAJOR | Redaction of JSON-encoded log/error text matched the single opening bracket of a container value, leaking every list/object element | `test_redact_secrets_redacts_json_list_valued_secret`, `test_redact_secrets_redacts_json_object_valued_secret`, `test_redact_secrets_redacts_nested_nonsensitive_containers`, `test_redact_secrets_redacts_json_fragment_with_prefix_and_suffix`, `test_redact_secrets_fails_closed_on_malformed_sensitive_container`, `test_redact_secrets_redacts_error_render_with_json_container`, `test_tool_runner_observe_logs_redacts_json_container_secret`, `test_set_investigation_run_state_redacts_json_container_last_error` |
+| 2 | MINOR | Required test gates accepted `1 passed, 2 xfailed`, `xpassed`, and a malformed vitest `Tests 2 passed (1)` total | `test_pytest_gate_rejects_xfailed_tests`, `test_pytest_gate_rejects_xpassed_tests`, `test_vitest_gate_rejects_passed_exceeding_total` |
+
+## 1 — MAJOR: structurally redact secret-bearing JSON containers
+
+**Root cause.** The round-2 assignment pattern treated a container's opening
+bracket as a bare value. `redact_secrets(json.dumps({'password': ['SYNTHETIC
+alpha beta', 'SECOND_SENTINEL']}))` produced
+`'{"password": [REDACTED]"SYNTHETIC alpha beta", "SECOND_SENTINEL"]}'`, leaking
+both elements; the object-valued form
+`{'password': {'value': 'SYNTHETIC alpha beta'}}` leaked identically. Native
+dictionary redaction (`redact_structure`) already replaced the whole value, but
+the JSON-*encoded string* path did not. The defect was proven at the real
+`ToolRunner.observe(logs)` sink and at the
+`repository.set_investigation_run_state` SQL `last_error` boundary.
+
+**Fix (class, not instance).** Text redaction is now layered:
+
+- `_redact_text` is a pure pattern/known-value pass (bearer/basic/token schemes,
+  `key`/`"key"` assignments, configured values). It never parses JSON, so
+  `redact_structure` can call it without a recursion cycle.
+- `_redact_json_string` decodes a complete JSON object/array and runs it through
+  `redact_structure` (which replaces a secret-shaped key's **entire** value,
+  whatever its type). Text that is not one JSON document is scanned for complete
+  embedded object fragments, which are redacted in place while surrounding
+  prefixes/suffixes are preserved. Ordinary JSON with no secret-shaped field is
+  returned byte-for-byte unchanged.
+- A container that cannot be parsed safely is redacted conservatively to the end
+  of the fragment by `_redact_text`, failing closed rather than leaking.
+
+`redact_structure` now delegates string values to `_redact_json_string`, so the
+same structural handling applies to native dictionaries and to JSON encoded
+inside a string. This is documented as best-effort redaction, **not** a DLP
+guarantee: it does not claim to defeat arbitrary obfuscation, and an
+unterminated sensitive container is over-redacted to the fragment end.
+
+**Evidence.**
+
+- RED (pre-fix): the round-3 probe tests `7 failed, 3 passed`; representative
+  `AssertionError` showing
+  `'SYNTHETIC alpha beta' is contained here: ... EDACTED]\"SYNTHETIC alpha beta\", \"SECOND_SENTINEL\"]`.
+  The `3 passed` are controls that assert preservation of ordinary JSON and
+  unicode, which the old instance-only fix already satisfied.
+- GREEN: `tests/unit/test_tools.py` `36 passed`; full `tests/unit` `98 passed`.
+- Existing controls unchanged: ordinary JSON, quoted strings, escapes, nesting,
+  unicode, and bounded output all still pass.
+
+## 2 — MINOR: required gates must reject xfail/xpass and non-exact vitest totals
+
+**Root cause.** `_pytest_gate` ignored `xfailed`/`xpassed`, so `1 passed, 2
+xfailed` was `passed`. `_test_gate` used `passed + ... < total` (`>=`
+acceptance), so a malformed `Tests 2 passed (1)` was `passed`. No required
+category is optional in v1.
+
+**Fix.** `_pytest_gate` fails on any `xfailed` or `xpassed` count (in addition to
+failures, errors, skips, and deselected tests). `_test_gate` now requires the
+executed statuses (`passed + failed + skipped + todo`) to equal the parsed total
+**exactly**, failing on any over- or under-count.
+
+**Evidence.**
+
+- RED (pre-fix): `3 failed, 1 passed`
+  (`test_pytest_gate_rejects_xfailed_tests`,
+  `test_pytest_gate_rejects_xpassed_tests`,
+  `test_vitest_gate_rejects_passed_exceeding_total`; the pass is the clean-total
+  control).
+- GREEN: `tests/unit/test_verify_runner.py` `18 passed`.
+
+**Scope of this round.** Only the shared redaction module
+(`src/incident_recovery/tools.py`), the verification driver gates
+(`scripts/verify.py`), their tests, and this document changed. No existing
+control or gate was weakened, and no real credential is used anywhere — all
+sentinels are synthetic.
+

@@ -109,3 +109,47 @@ def test_pytest_gate_accepts_clean_pass_control() -> None:
     ok, detail = verify._pytest_gate(verify._pytest_counts("38 passed in 1.23s"))
     assert ok is True
     assert "38" in detail
+
+
+# --- Round 3: xfail/xpass and exact vitest totals must fail a required gate ----
+
+
+def test_pytest_gate_rejects_xfailed_tests() -> None:
+    """The exact reported defect: ``1 passed, 2 xfailed`` passed the gate."""
+
+    counts = verify._pytest_counts("1 passed, 2 xfailed in 0.50s")
+    assert counts.get("xfailed") == 2
+    ok, detail = verify._pytest_gate(counts)
+    assert ok is False
+    assert "xfailed" in detail
+
+
+def test_pytest_gate_rejects_xpassed_tests() -> None:
+    counts = verify._pytest_counts("1 passed, 1 xpassed in 0.50s")
+    assert counts.get("xpassed") == 1
+    ok, detail = verify._pytest_gate(counts)
+    assert ok is False
+    assert "xpassed" in detail
+
+
+def test_pytest_gate_accepts_plain_pass_with_no_xfail_control() -> None:
+    ok, detail = verify._pytest_gate(verify._pytest_counts("42 passed in 1.0s"))
+    assert ok is True
+    assert "42" in detail
+
+
+def test_vitest_gate_rejects_passed_exceeding_total() -> None:
+    """The exact reported defect: ``Tests 2 passed (1)`` passed via ``>=``."""
+
+    counts = verify._vitest_counts("      Tests  2 passed (1)")
+    assert counts["total"] == 1
+    assert counts["passed"] == 2
+    ok, detail = verify._test_gate(counts)
+    assert ok is False
+    assert "mismatch" in detail.lower()
+
+
+def test_vitest_gate_accepts_exact_total_control() -> None:
+    ok, detail = verify._test_gate(verify._vitest_counts("      Tests  31 passed (31)"))
+    assert ok is True
+    assert "31" in detail
