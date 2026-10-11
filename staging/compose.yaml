@@ -9,8 +9,8 @@
 # credentials supplied through the gitignored `staging/.env`.
 #
 # Usage:
-#   python scripts/staging_env.py
-#   python scripts/staging_source.py
+#   uv run python scripts/staging_env.py
+#   uv run python scripts/staging_source.py
 #   docker compose -f staging/compose.yaml --env-file staging/.env \
 #     -p incident-recovery-staging config -q
 #   docker compose -f staging/compose.yaml --env-file staging/.env \

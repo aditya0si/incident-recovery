@@ -80,17 +80,17 @@ archive are never written to. The faulty image is transparently labelled
 
 ```bash
 # 1. Workload + control-plane configuration (generated, gitignored).
-python scripts/staging_env.py
-python scripts/staging_env.py --control
+uv run python scripts/staging_env.py
+uv run python scripts/staging_env.py --control
 
 # 2. Materialize the pinned snapshot and the isolated faulty copy.
-python scripts/staging_source.py
-python scripts/staging_fault.py
+uv run python scripts/staging_source.py
+uv run python scripts/staging_fault.py
 
 # 3. Run the real recovery driver: healthy -> faulty -> scripted investigation
 #    -> operator-harness approval -> traffic rollback -> sustained verification,
 #    plus a real workload dependency outage that must escalate.
-python scripts/staging_recovery.py
+uv run python scripts/staging_recovery.py
 ```
 
 The driver publishes the control/workload data endpoints on loopback only, via
@@ -135,5 +135,6 @@ adapter. This is not a live-provider compatibility claim.
 ## Remaining blockers / out of scope
 
 - Live paid-provider eligibility and bounded live investigation (Task 2).
-- Predeclared 12-case evaluation batch (Task 4) and independent full verification
-  (Task 5).
+- Predeclared 12-case evaluation: implemented in Task 4 and recorded in
+  `docs/staging-evidence.md` (scripted 12/12 passed, live blocked with 0 calls).
+- Independent full verification (Task 5).

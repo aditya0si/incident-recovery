@@ -42,10 +42,10 @@ upstream `docker-compose.yml` is not reused.
 
 ```bash
 # 1. Generate the gitignored, distinct staging credentials and probe loopback ports.
-python scripts/staging_env.py
+uv run python scripts/staging_env.py
 
 # 2. Materialize the pinned source snapshot (traversal-safe, hash/commit-bound).
-python scripts/staging_source.py
+uv run python scripts/staging_source.py
 
 # 3. Validate the Compose configuration without printing secrets.
 docker compose -f staging/compose.yaml --env-file staging/.env \
@@ -57,7 +57,7 @@ docker compose -f staging/compose.yaml --env-file staging/.env \
 
 # 5. Run the real authenticated baseline (registers two synthetic tenants,
 #    performs business writes, asserts isolation + readiness, inspects resources).
-python scripts/staging_baseline.py
+uv run python scripts/staging_baseline.py
 ```
 
 Tests:
@@ -149,7 +149,8 @@ through the labelled `scripted:tenant-api-staging` adapter, not a live model.
 ## Remaining blockers / out of scope
 
 - Live paid provider eligibility and bounded live investigation (Task 2).
-- Predeclared 12-case evaluation batch (Task 4) and independent full-verification
-  review (Task 5).
+- Predeclared 12-case evaluation: implemented in Task 4 and recorded in
+  `docs/staging-evidence.md` (scripted 12/12 passed, live blocked with 0 calls).
+- Independent full-verification review (Task 5).
 - The staging gateway/console are implemented for Task 3 under the `recovery`
-  profile; live paid evaluation and the full demo regression belong to Tasks 4–5.
+  profile; live paid evaluation and the full demo regression belong to Task 5.
