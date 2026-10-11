@@ -25,7 +25,7 @@ from incident_recovery.models import (
 )
 from incident_recovery.repository import IncidentRepository, LeaseLost, NotFound
 
-from .conftest import ApiHarness, TestDB
+from .conftest import ApiHarness, IntegrationDB
 
 BASE = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 
@@ -37,7 +37,7 @@ def _key(prefix: str) -> str:
 # --- concurrent duplicate alert keys yield one incident -----------------------
 
 
-async def test_concurrent_duplicate_alert_keys_yield_one_incident(test_db: TestDB) -> None:
+async def test_concurrent_duplicate_alert_keys_yield_one_incident(test_db: IntegrationDB) -> None:
     repo = IncidentRepository(test_db.pool)
     key = _key("dup")
     results = await asyncio.gather(
@@ -70,7 +70,7 @@ async def test_duplicate_alert_returns_existing_incident_via_api(harness: ApiHar
 # --- persistence / read-back across a new connection --------------------------
 
 
-async def test_incident_survives_new_connection(test_db: TestDB) -> None:
+async def test_incident_survives_new_connection(test_db: IntegrationDB) -> None:
     repo = IncidentRepository(test_db.pool)
     incident, _ = await repo.ingest_alert(_key("persist"), "demo-api", "s", {"a": 1})
     await repo.append_evidence(incident.id, "logs", EvidenceType.LOG, {"lines": ["x"]})
@@ -90,7 +90,7 @@ async def test_incident_survives_new_connection(test_db: TestDB) -> None:
 # --- legal transitions and conditional update refusal -------------------------
 
 
-async def test_illegal_state_transition_is_refused(test_db: TestDB) -> None:
+async def test_illegal_state_transition_is_refused(test_db: IntegrationDB) -> None:
     repo = IncidentRepository(test_db.pool)
     incident, _ = await repo.ingest_alert(_key("state"), "demo-api", None, {})
 
@@ -110,7 +110,7 @@ async def test_illegal_state_transition_is_refused(test_db: TestDB) -> None:
     assert events[-1].payload["to"] == "investigating"
 
 
-async def test_transition_for_unknown_incident_raises_not_found(test_db: TestDB) -> None:
+async def test_transition_for_unknown_incident_raises_not_found(test_db: IntegrationDB) -> None:
     repo = IncidentRepository(test_db.pool)
     with pytest.raises(NotFound):
         await repo.transition(uuid.uuid4(), IncidentState.INVESTIGATING)
@@ -119,7 +119,7 @@ async def test_transition_for_unknown_incident_raises_not_found(test_db: TestDB)
 # --- immutable evidence -------------------------------------------------------
 
 
-async def test_evidence_cannot_be_updated_or_deleted(test_db: TestDB) -> None:
+async def test_evidence_cannot_be_updated_or_deleted(test_db: IntegrationDB) -> None:
     repo = IncidentRepository(test_db.pool)
     incident, _ = await repo.ingest_alert(_key("evidence"), "demo-api", None, {})
     evidence = await repo.append_evidence(
@@ -150,7 +150,7 @@ async def test_oversized_evidence_payload_is_refused(repo: IncidentRepository) -
 
 
 async def test_expired_lease_allows_takeover_and_stale_worker_is_refused(
-    test_db: TestDB,
+    test_db: IntegrationDB,
 ) -> None:
     repo = IncidentRepository(test_db.pool)
     incident, _ = await repo.ingest_alert(_key("lease"), "demo-api", None, {})

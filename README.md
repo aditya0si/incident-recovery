@@ -5,11 +5,32 @@ switches real HTTP traffic between a predefined healthy and broken version, with
 a durable incident workflow, operator control surface, and approval-gated,
 independently verified rollback.
 
-**Milestones 1–5.** This repository implements the real demo deployment slice
+**Milestones 1–6.** This repository implements the real demo deployment slice
 (Task 1), the durable incident workflow plus operator API (Task 2),
 approval-gated rollback with durable recovery and sustained functional
 verification (Task 3), the bounded, evidence-backed investigation agent
-(Task 4), and the operator console (Task 5).
+(Task 4), the operator console (Task 5), and the reproducible whole-stack
+verification driver with adversarial resilience gates (Task 6).
+
+### Real service recovery vs scripted agent inference
+
+These are deliberately separate, and the console and reports always label which
+is which:
+
+- **Real service recovery.** The gateway reads the active revision from
+  PostgreSQL and proxies real HTTP traffic to the predefined healthy/broken demo
+  containers. Fault injection, deployment reservations, approvals, the restricted
+  executor, and sustained functional verification (three consecutive functional
+  checks two seconds apart within 30 seconds) all run as real services.
+- **Scripted agent inference.** The investigation adapter is a deterministic
+  script (`scripted:demo`), enabled only by the explicit
+  `compose.investigation.yaml` override. It requests the real read-only tools
+  (`health`, `logs`, `metrics`, `deployments`) but is not a language model. Every
+  run records its identity, and the console labels it prominently.
+- **Live model.** With no runtime provider configured the worker fails closed
+  (`missing-credentials`) and escalates; it never substitutes a script. Live
+  investigation is an optional, separately configured path (see
+  [Whole-stack verification](#reproducible-whole-stack-verification)).
 
 ## Operator console
 
@@ -304,6 +325,44 @@ docker compose -p incident-recovery -f compose.yaml -f compose.investigation.yam
 uv run pytest tests/e2e/test_console.py -v
 docker compose -p incident-recovery up --build -d --wait   # restore default
 ```
+
+## Reproducible whole-stack verification
+
+`scripts/verify.py` is the reproducible gate driver. It runs real commands,
+records each command's exit code and captured output, writes a machine-readable
+report plus sanitized durable logs, and distinguishes **passed / failed /
+blocked**. It exits non-zero if any *required* check fails or is blocked; the
+optional live-model check is reported separately.
+
+```bash
+uv run python scripts/verify.py --docker --ui   # all backend, frontend, Docker, and browser checks
+uv run python scripts/verify.py                 # host-only (unit + frontend) checks
+uv run python scripts/verify.py --live          # additionally run the optional live-model check
+```
+
+- The driver applies the test-only control override and the explicit
+  scripted-investigation override for the Docker E2E phase and **restores the
+  default stack in a `finally` block even if a check fails**.
+- No secrets are printed: output is sanitized against the values in the
+  gitignored `.env`, Compose config is validated only with `config -q`, and it
+  scans tracked files for credential material without printing any value.
+- Report: `.hermes/evidence/verify/report.json`; logs:
+  `.hermes/evidence/verify/logs/`. The committed summary and observed counts are
+  in [docs/evidence.md](docs/evidence.md).
+
+The last full run (`--docker --ui`) recorded **19 checks passed, 0 failed,
+0 blocked**, covering **154 executed test cases** (101 backend, 31 frontend, and
+22 real Docker/browser E2E). Counts are generated from the actual report; see
+`docs/evidence.md` for the exact commands and results.
+
+### Optional live-model check
+
+`--live` uses runtime credentials already configured through
+`MODEL_BASE_URL` / `MODEL_NAME` / `MODEL_API_KEY` (separate from any coding-CLI
+credential). When they are absent the check is reported as **blocked**
+(`live_model_unconfigured`), never as a success. When configured it performs a
+real provider call and asserts the recorded investigation adapter is
+`openai-compatible:*`.
 
 ## Operator API demonstration
 

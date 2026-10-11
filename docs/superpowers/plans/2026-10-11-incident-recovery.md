@@ -121,3 +121,26 @@ User-selected method is preserved: one OpenCode DeepSeek writer per scoped miles
 
 ## Self-review
 Spec acceptance 1–2 maps to Task 1; 3 and 10 to Task 4; 4–7 and 9 to Task 3; 8 to Tasks 2, 3, and 6; 11 to Task 5; 12 to every milestone and Task 6. All five Review Focus cases have explicit owning tests. Runtime-model credentials remain a possible live-demo blocker, not permission to fabricate or silently substitute. The gateway fulfills real revision switching without pretending a Docker socket mount makes the executor sandboxed.
+
+## Disposition notes (post-approval addendum)
+
+This addendum records dispositions for two approved-plan statements that were
+refined during implementation. It is appended explicitly; the approved text above
+is unchanged and is not silently rewritten.
+
+1. **Least-privilege refinement — no Docker socket anywhere.** The Global
+   Constraints above say "only executor receives Docker socket". Analysis of the
+   actual required capability (Task 3) showed that rollback is a pure PostgreSQL
+   desired-state change between two predefined demo targets and needs no Docker
+   power at all. The implemented disposition is therefore **no container receives
+   the Docker socket**, and the executor exposes no host port. This is an
+   intentional strengthening of the original constraint, documented in
+   `docs/security.md`, and re-verified against the live containers in
+   `tests/e2e/test_resilience.py`. Container restart (which would need Docker
+   power) remains deferred.
+2. **asyncpg consistency.** The Tech Stack line names SQLAlchemy. The
+   implemented disposition is **asyncpg only** on the single PostgreSQL source of
+   truth; no second ORM or SQLAlchemy layer was introduced. This keeps the
+   transactional, conditional-`UPDATE`, lease, and immutability semantics in one
+   place (`src/incident_recovery/repository.py`, `db.py`) and matches the
+   approved interface contracts.

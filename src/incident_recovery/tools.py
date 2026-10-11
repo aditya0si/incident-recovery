@@ -73,19 +73,64 @@ def redact_secrets(text: str, *, extra: Iterable[str] = ()) -> str:
     return redacted
 
 
+def _encoded_size(payload: dict) -> int:
+    return len(json.dumps(payload, separators=(",", ":"), default=str).encode("utf-8"))
+
+
 def _bounded_json(payload: dict, max_bytes: int = MAX_RESPONSE_BYTES) -> dict:
-    encoded = json.dumps(payload, separators=(",", ":"), default=str)
-    if len(encoded.encode("utf-8")) <= max_bytes:
+    """Return a copy of ``payload`` whose JSON encoding never exceeds ``max_bytes``.
+
+    A hostile workload can return an arbitrarily large log list or a single huge
+    string field.  A tool observation must still be persistable as bounded
+    evidence, so this shrinks the payload deterministically: it repeatedly halves
+    the largest list-valued field, then truncates the largest string, then drops
+    the largest remaining field, until the encoding fits.  The original mapping is
+    never mutated.
+    """
+
+    if _encoded_size(payload) <= max_bytes:
         return payload
-    # Drop the largest list-valued field first, then hard-truncate a blob.
-    trimmed = dict(payload)
-    for key, value in list(trimmed.items()):
-        if isinstance(value, list) and len(value) > 1:
-            trimmed[key] = value[: max(1, len(value) // 2)]
-            trimmed["truncated"] = True
-            if len(json.dumps(trimmed, default=str).encode("utf-8")) <= max_bytes:
-                return trimmed
+
+    trimmed: dict = dict(payload)
     trimmed["truncated"] = True
+    for _ in range(512):
+        if _encoded_size(trimmed) <= max_bytes:
+            return trimmed
+        lists = [
+            (key, value)
+            for key, value in trimmed.items()
+            if isinstance(value, list) and len(value) > 0
+        ]
+        if lists:
+            key, value = max(lists, key=lambda item: _encoded_size({"v": item[1]}))
+            trimmed[key] = value[: max(1, len(value) // 2)]
+            continue
+        strings = [
+            (key, value)
+            for key, value in trimmed.items()
+            if isinstance(value, str) and key != "truncated"
+        ]
+        if strings:
+            key, value = max(strings, key=lambda item: len(item[1]))
+            overflow = _encoded_size(trimmed) - max_bytes
+            keep = max(0, len(value) - overflow - 64)
+            trimmed[key] = value[:keep] + "[truncated]"
+            continue
+        mappings = [
+            (key, value)
+            for key, value in trimmed.items()
+            if isinstance(value, dict) and len(value) > 0
+        ]
+        if mappings:
+            key, value = max(mappings, key=lambda item: _encoded_size({"v": item[1]}))
+            largest = max(value, key=lambda k: _encoded_size({"v": value[k]}))
+            del value[largest]
+            continue
+        candidates = [key for key in trimmed if key != "truncated"]
+        if not candidates:
+            return trimmed
+        key = max(candidates, key=lambda k: _encoded_size({"v": trimmed[k]}))
+        trimmed.pop(key, None)
     return trimmed
 
 

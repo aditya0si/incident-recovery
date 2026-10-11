@@ -39,7 +39,7 @@ from incident_recovery.models import (
 from incident_recovery.repository import IncidentRepository
 from incident_recovery.tools import ToolRunner
 
-from .conftest import TestDB
+from .conftest import IntegrationDB
 
 BASE = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 HEALTHY = "healthy-v1"
@@ -113,7 +113,7 @@ def _tools(repo: IncidentRepository) -> ToolRunner:
 
 
 async def test_claim_next_investigation_sets_investigating_and_lease(
-    test_db: TestDB,
+    test_db: IntegrationDB,
 ) -> None:
     repo = IncidentRepository(test_db.pool)
     incident, _ = await repo.ingest_alert(_key("claim"), "demo-api", "broken", {})
@@ -127,7 +127,7 @@ async def test_claim_next_investigation_sets_investigating_and_lease(
 
 
 async def test_investigation_state_machine_has_no_illegal_shortcut(
-    test_db: TestDB,
+    test_db: IntegrationDB,
 ) -> None:
     from incident_recovery.models import IllegalStateTransition
 
@@ -142,7 +142,7 @@ async def test_investigation_state_machine_has_no_illegal_shortcut(
 
 
 async def test_investigation_budget_and_steps_survive_worker_restart(
-    test_db: TestDB,
+    test_db: IntegrationDB,
 ) -> None:
     repo = IncidentRepository(test_db.pool)
     incident, _ = await repo.ingest_alert(_key("restart"), "demo-api", None, {})
@@ -204,7 +204,7 @@ async def test_investigation_budget_and_steps_survive_worker_restart(
 
 
 async def test_stale_lease_cannot_write_evidence_step_or_escalation(
-    test_db: TestDB,
+    test_db: IntegrationDB,
 ) -> None:
     repo = IncidentRepository(test_db.pool)
     incident, _ = await repo.ingest_alert(_key("stale"), "demo-api", None, {})
@@ -236,7 +236,7 @@ async def test_stale_lease_cannot_write_evidence_step_or_escalation(
 
 
 async def test_full_scripted_investigation_records_evidence_and_proposal(
-    test_db: TestDB,
+    test_db: IntegrationDB,
 ) -> None:
     repo = IncidentRepository(test_db.pool)
     store = DeploymentStore(test_db.pool)
@@ -285,7 +285,7 @@ async def test_full_scripted_investigation_records_evidence_and_proposal(
 
 
 async def test_poisoned_logs_without_functional_failure_escalate(
-    test_db: TestDB,
+    test_db: IntegrationDB,
 ) -> None:
     repo = IncidentRepository(test_db.pool)
     store = DeploymentStore(test_db.pool)

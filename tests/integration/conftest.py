@@ -44,14 +44,14 @@ def _host_dsn() -> str:
 
 
 @dataclass
-class TestDB:
+class IntegrationDB:
     pool: asyncpg.Pool
     dsn: str
     schema: str
 
 
 @pytest_asyncio.fixture
-async def test_db() -> TestDB:
+async def test_db() -> IntegrationDB:
     dsn = _host_dsn()
     try:
         admin = await asyncpg.connect(dsn)
@@ -69,7 +69,7 @@ async def test_db() -> TestDB:
 
     pool = await db_module.create_pool(dsn, schema=schema)
     await db_module.bootstrap_schema(pool)
-    db = TestDB(pool=pool, dsn=dsn, schema=schema)
+    db = IntegrationDB(pool=pool, dsn=dsn, schema=schema)
     try:
         yield db
     finally:
@@ -82,12 +82,12 @@ async def test_db() -> TestDB:
 
 
 @pytest_asyncio.fixture
-async def repo(test_db: TestDB) -> IncidentRepository:
+async def repo(test_db: IntegrationDB) -> IncidentRepository:
     return IncidentRepository(test_db.pool)
 
 
 @pytest_asyncio.fixture
-async def store(test_db: TestDB) -> DeploymentStore:
+async def store(test_db: IntegrationDB) -> DeploymentStore:
     return DeploymentStore(test_db.pool)
 
 
@@ -158,7 +158,7 @@ class ApiHarness:
 
 
 @pytest_asyncio.fixture
-async def api_app(test_db: TestDB) -> ApiApp:
+async def api_app(test_db: IntegrationDB) -> ApiApp:
     repo = IncidentRepository(test_db.pool)
     store = DeploymentStore(test_db.pool)
     switch = RealSwitchClient(store)

@@ -1,4 +1,4 @@
-# Security model and trust boundaries (Milestones 1–5)
+# Security model and trust boundaries (Milestones 1–6)
 
 ## Network and credential boundaries
 
@@ -135,3 +135,24 @@ The investigation agent is deliberately the least-privileged component:
   server re-validates generation and TTL; there is no proposal-injection path, and
   the in-flight/stale/expired controls only disable client intent — the server
   refusal is authoritative.
+
+## Adversarial resilience and verification boundary (Milestone 6)
+
+- **No privileged surface.** The Docker-socket prohibition is re-verified against
+  the live containers: no service (including `executor`, `console`, and `worker`)
+  is mounted with the Docker socket, and `executor` publishes no host port. The
+  public gateway exposes no switch route; the internal switch requires the
+  internal token. See `tests/e2e/test_resilience.py`.
+- **Hostile observations stay bounded.** Tool observations from an untrusted or
+  compromised workload are deterministically bounded below the evidence size cap
+  and secret-shaped values are redacted before persistence, so an oversized log
+  list or a single huge field cannot grow the store or derail the loop.
+- **Fail-closed recovery admission.** A recovery admission is re-validated at the
+  authoritative switch (fixed service, revision/generation, known-good target,
+  TTL, single consumption); an approval that expired during admission, a stale
+  generation, or a competing reservation is refused and the incident becomes
+  `recovery_failed`, never `resolved`.
+- **Sanitized evidence.** The verification driver (`scripts/verify.py`) never
+  prints secrets, validates Compose config only with `config -q`, sanitizes all
+  captured output against the gitignored `.env` before logging, and scans tracked
+  files for credential material without printing any value.

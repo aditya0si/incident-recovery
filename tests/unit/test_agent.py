@@ -161,6 +161,47 @@ def test_tool_runner_rejects_scripts_on_healthy_path_only_via_fixed_tool() -> No
     assert set(agent_module.ALLOWED_TOOLS) == {"health", "logs", "metrics", "deployments"}
 
 
+def test_tool_runner_bounds_oversized_poisoned_observations() -> None:
+    """A hostile workload cannot make a tool observation exceed the bound.
+
+    Oversized single-string fields and huge log line lists must both be reduced
+    below ``MAX_RESPONSE_BYTES`` so the observation can be persisted as bounded
+    evidence instead of raising ``PayloadTooLarge`` and derailing the loop.
+    """
+    from incident_recovery.tools import MAX_RESPONSE_BYTES
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/logs":
+            return httpx.Response(
+                200,
+                json={"lines": [{"message": "y" * 500} for _ in range(200)]},
+            )
+        if request.url.path == "/api/metrics":
+            return httpx.Response(
+                200,
+                json={"revision": "broken-v2", "blob": "x" * 100_000, "http_status": 200},
+            )
+        return httpx.Response(404)
+
+    async def run() -> None:
+        client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://gateway.test"
+        )
+        runner = ToolRunner(repo=None, gateway_url="http://gateway.test", client=client)
+        try:
+            logs = await runner.observe(ToolRequest(tool="logs", lines=200))
+            metrics = await runner.observe(ToolRequest(tool="metrics"))
+        finally:
+            await client.aclose()
+        for observation in (logs, metrics):
+            encoded = json.dumps(
+                observation.summary, separators=(",", ":"), default=str
+            ).encode("utf-8")
+            assert len(encoded) <= MAX_RESPONSE_BYTES, (observation.tool, len(encoded))
+
+    asyncio.run(run())
+
+
 # --- scripted and live adapters -----------------------------------------------
 
 

@@ -29,7 +29,7 @@ from incident_recovery.repository import IncidentRepository
 from incident_recovery.verification import FunctionalCheck, RecoveryVerifier
 from incident_recovery.worker import RecoveryWorker
 
-from .conftest import ApiHarness, TestDB
+from .conftest import ApiHarness, IntegrationDB
 
 BASE = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 HEALTHY = "healthy-v1"
@@ -546,7 +546,7 @@ async def test_executor_success_alone_does_not_resolve(
 
 
 async def test_executor_rejects_unsupported_fields_and_unknown_operation(
-    test_db: TestDB,
+    test_db: IntegrationDB,
 ) -> None:
     from incident_recovery.executor import create_executor_app
 
@@ -577,7 +577,7 @@ async def test_executor_rejects_unsupported_fields_and_unknown_operation(
 
 
 async def test_executor_requires_persisted_operation(
-    test_db: TestDB,
+    test_db: IntegrationDB,
 ) -> None:
     from incident_recovery.executor import create_executor_app
 
