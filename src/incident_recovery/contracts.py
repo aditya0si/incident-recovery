@@ -53,7 +53,12 @@ class SwitchRequest(BaseModel):
 
 
 class OperationRecord(BaseModel):
-    """Persisted idempotency record for a previously applied switch."""
+    """Persisted idempotency record for a previously applied switch.
+
+    ``scope`` records the reservation scope the switch was applied under so an
+    exact replay can require an exact operation/scope/request match rather than
+    matching on the revision alone.
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -62,6 +67,7 @@ class OperationRecord(BaseModel):
     expected_generation: int
     target_revision: Revision
     snapshot: DeploymentSnapshot
+    scope: Optional[str] = None
 
 
 class SwitchDecision(BaseModel):

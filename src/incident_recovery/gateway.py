@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
 
 import asyncpg
@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS deployment_operations (
     result_generation    INTEGER NOT NULL,
     result_activated_at  TIMESTAMPTZ NOT NULL,
     result_predecessor   TEXT,
+    scope                TEXT,
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -105,6 +106,7 @@ def evaluate_switch(
             prior.service_id != SERVICE_ID
             or prior.expected_generation != request.expected_generation
             or prior.target_revision != request.target_revision
+            or (prior.scope is not None and prior.scope != request.scope)
         ):
             return SwitchDecision(status="conflict", snapshot=current)
         return SwitchDecision(status="replayed", snapshot=prior.snapshot)
@@ -157,7 +159,7 @@ class DeploymentStore:
             row = await conn.fetchrow(
                 "SELECT operation_id, service_id, expected_generation, "
                 "target_revision, result_revision, result_generation, "
-                "result_activated_at, result_predecessor "
+                "result_activated_at, result_predecessor, scope "
                 "FROM deployment_operations WHERE operation_id = $1",
                 operation_id,
             )
@@ -215,7 +217,6 @@ class DeploymentStore:
         return True
 
     async def switch(self, request: SwitchRequest) -> SwitchDecision:
-        now = datetime.now(timezone.utc)
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 # Row lock serialises all switches, including exact replays.
@@ -227,6 +228,25 @@ class DeploymentStore:
                 if state_row is None:
                     raise RuntimeError("deployment_state is not initialised")
                 current = _row_to_snapshot(state_row)
+
+                # Exact durable replay first: an operation whose switch already
+                # committed returns its recorded result *before* any fresh
+                # admission check.  This closes the crash window between the
+                # durable apply and the executor's record: a retry under a now
+                # expired approval replays instead of being refused, and it
+                # never creates a new side effect.  Only an exact
+                # operation/scope/request match qualifies, never the revision
+                # alone.
+                prior_row = await conn.fetchrow(
+                    "SELECT operation_id, service_id, expected_generation, "
+                    "target_revision, result_revision, result_generation, "
+                    "result_activated_at, result_predecessor, scope "
+                    "FROM deployment_operations WHERE operation_id = $1",
+                    request.operation_id,
+                )
+                prior = self._row_to_operation(prior_row) if prior_row else None
+                if prior is not None and self._exact_replay(prior, request):
+                    return SwitchDecision(status="replayed", snapshot=prior.snapshot)
 
                 # Authoritative mutation gate: every switch must present the
                 # active reservation it owns, with matching scope and scope
@@ -243,19 +263,18 @@ class DeploymentStore:
                 ):
                     return SwitchDecision(status="unauthorized", snapshot=current)
 
+                # Refresh the authoritative admission time *after* every lock
+                # wait, immediately before the mutation decision.  Using the
+                # database ``clock_timestamp()`` (not the transaction ``now()``,
+                # which is fixed at transaction start) means an approval that
+                # expired while this switch waited on the row lock is seen as
+                # expired and can never be applied.
+                now = await conn.fetchval("SELECT clock_timestamp()")
+
                 if request.scope == "recovery" and not await self._recovery_authorized(
                     conn, current, request, now
                 ):
                     return SwitchDecision(status="unauthorized", snapshot=current)
-
-                prior_row = await conn.fetchrow(
-                    "SELECT operation_id, service_id, expected_generation, "
-                    "target_revision, result_revision, result_generation, "
-                    "result_activated_at, result_predecessor "
-                    "FROM deployment_operations WHERE operation_id = $1",
-                    request.operation_id,
-                )
-                prior = self._row_to_operation(prior_row) if prior_row else None
 
                 decision = evaluate_switch(current, request, prior, now)
 
@@ -273,8 +292,8 @@ class DeploymentStore:
                     await conn.execute(
                         "INSERT INTO deployment_operations (operation_id, service_id, "
                         "expected_generation, target_revision, result_revision, "
-                        "result_generation, result_activated_at, result_predecessor) "
-                        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                        "result_generation, result_activated_at, result_predecessor, scope) "
+                        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
                         request.operation_id,
                         SERVICE_ID,
                         request.expected_generation,
@@ -283,6 +302,7 @@ class DeploymentStore:
                         snap.generation,
                         snap.activated_at,
                         snap.predecessor,
+                        request.scope,
                     )
                     await conn.execute(
                         "INSERT INTO deployment_history (service_id, from_revision, "
@@ -296,6 +316,17 @@ class DeploymentStore:
                         snap.activated_at,
                     )
                 return decision
+
+    @staticmethod
+    def _exact_replay(prior: OperationRecord, request: SwitchRequest) -> bool:
+        """True only for an exact operation/scope/request match (no new effect)."""
+
+        return (
+            prior.service_id == SERVICE_ID
+            and prior.expected_generation == request.expected_generation
+            and prior.target_revision == request.target_revision
+            and prior.scope == request.scope
+        )
 
     @staticmethod
     def _row_to_operation(row: asyncpg.Record) -> OperationRecord:
@@ -312,6 +343,7 @@ class DeploymentStore:
             expected_generation=row["expected_generation"],
             target_revision=row["target_revision"],
             snapshot=snapshot,
+            scope=row["scope"],
         )
 
 

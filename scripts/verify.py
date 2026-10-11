@@ -206,18 +206,58 @@ def _pytest_counts(output: str) -> dict:
         match = re.search(rf"(\d+) {label}\b", output)
         if match:
             counts[label.rstrip("s") if label == "errors" else label] = int(match.group(1))
+    if re.search(r"no tests ran", output, re.IGNORECASE):
+        counts["no_tests_ran"] = 1
     return counts
+
+
+def _pytest_gate(counts: dict) -> tuple[bool, str]:
+    """Decide whether a pytest run actually executed passing tests.
+
+    A zero-test run, a skipped-only run, a collection error, or any failing test
+    can never be reported as success.  Required suites must execute at least one
+    passing test and skip nothing; a suite that did not run is a failure, not a
+    pass.
+    """
+
+    passed = counts.get("passed", 0)
+    failed = counts.get("failed", 0)
+    errors = counts.get("error", 0)
+    skipped = counts.get("skipped", 0)
+    if failed or errors:
+        return False, f"{failed + errors} failing/error test(s)"
+    if skipped:
+        return False, f"{skipped} skipped test(s)"
+    if counts.get("no_tests_ran") or passed == 0:
+        return False, "no tests executed"
+    return True, f"{passed} passed"
 
 
 def _vitest_counts(output: str) -> dict:
     counts: dict[str, int] = {}
-    match = re.search(r"Tests\s+(\d+) passed", output)
-    if match:
-        counts["passed"] = int(match.group(1))
-    failed = re.search(r"Tests\s+(\d+) failed", output)
-    if failed:
-        counts["failed"] = int(failed.group(1))
+    for label in ("passed", "failed", "skipped"):
+        match = re.search(rf"(\d+)\s+{label}\b", output)
+        if match:
+            counts[label] = int(match.group(1))
     return counts
+
+
+def _test_gate(counts: dict) -> tuple[bool, str]:
+    """Decide whether a JS/TS test run actually executed passing tests.
+
+    Mirrors :func:`_pytest_gate`: zero tests, skips, or failures cannot pass.
+    """
+
+    passed = counts.get("passed", 0)
+    failed = counts.get("failed", 0)
+    skipped = counts.get("skipped", 0)
+    if failed:
+        return False, f"{failed} failing test(s)"
+    if skipped:
+        return False, f"{skipped} skipped test(s)"
+    if passed == 0:
+        return False, "no tests executed"
+    return True, f"{passed} passed"
 
 
 class Verifier:
@@ -268,6 +308,15 @@ class Verifier:
             status, detail = "failed", "expected a non-zero exit"
         else:
             status, detail = "passed", detail_ok
+        # A required test suite must have actually executed passing tests: an
+        # empty, skipped-only, or collection-error run cannot pass silently.
+        if category == "required" and parse in (_pytest_counts, _vitest_counts):
+            gate = _pytest_gate if parse is _pytest_counts else _test_gate
+            gate_ok, gate_detail = gate(counts)
+            if status == "passed" and not gate_ok:
+                status, detail = "failed", gate_detail
+            elif status == "passed":
+                detail = gate_detail
         return self.record(
             Check(
                 name=name,

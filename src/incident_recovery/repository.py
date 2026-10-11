@@ -58,6 +58,7 @@ from .models import (
     utcnow,
     validate_payload,
 )
+from .tools import redact_structure
 
 _OPERATION_COLS = (
     "id, incident_id, approval_id, status, target_revision, result, created_at, "
@@ -124,7 +125,8 @@ class IncidentRepository:
     ) -> tuple[Incident, bool]:
         """Return ``(incident, created)``; duplicate keys map to one incident."""
 
-        validate_payload(payload)
+        body = redact_structure(dict(payload))
+        validate_payload(body)
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
@@ -134,7 +136,7 @@ class IncidentRepository:
                     dedupe_key,
                     service_id,
                     summary,
-                    dict(payload),
+                    body,
                 )
                 if row is not None:
                     await conn.execute(
@@ -184,7 +186,8 @@ class IncidentRepository:
         *,
         epoch: int = 0,
     ) -> Evidence:
-        validate_payload(payload)
+        body = redact_structure(dict(payload))
+        validate_payload(body)
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
@@ -194,7 +197,7 @@ class IncidentRepository:
                     incident_id,
                     source,
                     EvidenceType(evidence_type).value,
-                    dict(payload),
+                    body,
                     epoch,
                 )
                 await conn.execute(
@@ -233,7 +236,7 @@ class IncidentRepository:
         kind: EventKind,
         payload: Optional[Mapping[str, Any]] = None,
     ) -> Event:
-        body = dict(payload or {})
+        body = redact_structure(dict(payload or {}))
         validate_payload(body)
         row = await self.pool.fetchrow(
             "INSERT INTO incident_events (incident_id, kind, payload) "
@@ -314,7 +317,7 @@ class IncidentRepository:
                     raise IllegalStateTransition(
                         f"cannot move {current['state']} -> {target.value}"
                     )
-                payload = {"to": target.value, **dict(event_payload or {})}
+                payload = redact_structure({"to": target.value, **dict(event_payload or {})})
                 validate_payload(payload)
                 await conn.execute(
                     "INSERT INTO incident_events (incident_id, kind, payload) "
@@ -402,7 +405,7 @@ class IncidentRepository:
                     raise IllegalStateTransition(
                         f"cannot move {current['state']} -> {target.value}"
                     )
-                payload = {"to": target.value, **dict(event_payload or {})}
+                payload = redact_structure({"to": target.value, **dict(event_payload or {})})
                 validate_payload(payload)
                 await conn.execute(
                     "INSERT INTO incident_events (incident_id, kind, payload) "
@@ -582,7 +585,8 @@ class IncidentRepository:
 
         Terminal operations are never rewritten by a late status change.
         """
-        validate_payload(result or {})
+        body = redact_structure(dict(result)) if result is not None else None
+        validate_payload(body or {})
         row = await self.pool.fetchrow(
             f"UPDATE recovery_operations SET status = $2, "
             f"result = COALESCE($3::jsonb, result), "
@@ -594,7 +598,7 @@ class IncidentRepository:
             f"RETURNING {_OPERATION_COLS}",
             operation_id,
             status,
-            dict(result) if result is not None else None,
+            body,
             last_error,
             bump_attempts,
             mark_verified,
@@ -772,23 +776,27 @@ class IncidentRepository:
                     "VALUES ($1, $2, $3::jsonb)",
                     incident_id,
                     EventKind.APPROVED.value,
-                    {
-                        "approval_id": str(approval_row["id"]),
-                        "operation_id": str(operation_id),
-                        "digest": proposal_digest,
-                        "actor": actor,
-                        "expires_at": ensure_utc(expires_at).isoformat(),
-                    },
+                    redact_structure(
+                        {
+                            "approval_id": str(approval_row["id"]),
+                            "operation_id": str(operation_id),
+                            "digest": proposal_digest,
+                            "actor": actor,
+                            "expires_at": ensure_utc(expires_at).isoformat(),
+                        }
+                    ),
                 )
                 await conn.execute(
                     "INSERT INTO incident_events (incident_id, kind, payload) "
                     "VALUES ($1, $2, $3::jsonb)",
                     incident_id,
                     EventKind.RECOVERY_STARTED.value,
-                    {
-                        "operation_id": str(operation_id),
-                        "target_revision": target,
-                    },
+                    redact_structure(
+                        {
+                            "operation_id": str(operation_id),
+                            "target_revision": target,
+                        }
+                    ),
                 )
         return _row_to_approval(approval_row), _row_to_operation(operation_row), True
 
@@ -807,7 +815,8 @@ class IncidentRepository:
         self, operation_id: UUID, result: Mapping[str, Any]
     ) -> Operation:
         """Persist a successful execution and its distinct event atomically."""
-        validate_payload(result)
+        body = redact_structure(dict(result))
+        validate_payload(body)
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
@@ -816,7 +825,7 @@ class IncidentRepository:
                     f"AND status NOT IN ('verified','failed') RETURNING {_OPERATION_COLS}",
                     operation_id,
                     "executed",
-                    dict(result),
+                    body,
                 )
                 if row is None:
                     existing = await self.get_operation(operation_id)
@@ -828,7 +837,7 @@ class IncidentRepository:
                     "VALUES ($1, $2, $3::jsonb)",
                     row["incident_id"],
                     EventKind.RECOVERY_EXECUTED.value,
-                    {"operation_id": str(operation_id), **dict(result)},
+                    {"operation_id": str(operation_id), **body},
                 )
         return _row_to_operation(row)
 
@@ -878,12 +887,14 @@ class IncidentRepository:
                     "VALUES ($1, $2, $3::jsonb)",
                     incident_id,
                     EventKind.REJECTED.value,
-                    {
-                        "actor": actor,
-                        "reason": reason,
-                        "digest": proposal_digest,
-                        "at": instant.isoformat(),
-                    },
+                    redact_structure(
+                        {
+                            "actor": actor,
+                            "reason": reason,
+                            "digest": proposal_digest,
+                            "at": instant.isoformat(),
+                        }
+                    ),
                 )
         return _row_to_incident(row)
 
@@ -994,7 +1005,8 @@ class IncidentRepository:
         resolve the incident.  A consumed approval/operation is terminal.
         """
         instant = ensure_utc(now or utcnow())
-        validate_payload(verification)
+        body = redact_structure(dict(verification))
+        validate_payload(body)
         target_state = IncidentState.RESOLVED if success else IncidentState.RECOVERY_FAILED
         predecessors = [state.value for state in legal_predecessors(target_state)]
         async with self.pool.acquire() as conn:
@@ -1033,7 +1045,7 @@ class IncidentRepository:
                     "updated_at = now() WHERE id = $1",
                     operation_id,
                     OPERATION_VERIFIED if success else OPERATION_FAILED,
-                    dict(verification),
+                    body,
                     success,
                 )
                 await conn.execute(
@@ -1050,7 +1062,7 @@ class IncidentRepository:
                         if success
                         else EventKind.RECOVERY_FAILED.value
                     ),
-                    dict(verification),
+                    body,
                 )
         return _row_to_incident(row)
 
@@ -1066,7 +1078,8 @@ class IncidentRepository:
     ) -> Incident:
         """Persist a failed recovery operation and move the incident to recovery_failed."""
         instant = ensure_utc(now or utcnow())
-        payload = {"error": error, **dict(result or {})}
+        result_body = redact_structure(dict(result)) if result is not None else None
+        payload = redact_structure({"error": error, **dict(result or {})})
         validate_payload(payload)
         predecessors = [state.value for state in legal_predecessors(IncidentState.RECOVERY_FAILED)]
         async with self.pool.acquire() as conn:
@@ -1104,7 +1117,7 @@ class IncidentRepository:
                     operation_id,
                     OPERATION_FAILED,
                     error,
-                    dict(result) if result is not None else None,
+                    result_body,
                 )
                 await conn.execute(
                     "UPDATE deployment_reservations SET status = 'released', "
@@ -1294,7 +1307,7 @@ class IncidentRepository:
         now: Optional[datetime] = None,
         advance_tool_calls: bool = False,
     ) -> InvestigationStep:
-        body = dict(payload)
+        body = redact_structure(dict(payload))
         validate_payload(body)
         instant = ensure_utc(now or utcnow())
         async with self.pool.acquire() as conn:
@@ -1350,7 +1363,8 @@ class IncidentRepository:
         worker_id: str,
         now: Optional[datetime] = None,
     ) -> Evidence:
-        validate_payload(payload)
+        body = redact_structure(dict(payload))
+        validate_payload(body)
         instant = ensure_utc(now or utcnow())
         async with self.pool.acquire() as conn:
             async with conn.transaction():
@@ -1363,7 +1377,7 @@ class IncidentRepository:
                     incident_id,
                     source,
                     EvidenceType(evidence_type).value,
-                    dict(payload),
+                    body,
                     epoch,
                 )
                 await conn.execute(
@@ -1436,12 +1450,14 @@ class IncidentRepository:
                     "VALUES ($1, $2, $3::jsonb)",
                     incident_id,
                     EventKind.PROPOSAL_CREATED.value,
-                    {
-                        "proposal_id": str(row["id"]),
-                        "digest": digest,
-                        "epoch": epoch,
-                        "target_revision": target_revision,
-                    },
+                    redact_structure(
+                        {
+                            "proposal_id": str(row["id"]),
+                            "digest": digest,
+                            "epoch": epoch,
+                            "target_revision": target_revision,
+                        }
+                    ),
                 )
         return _row_to_proposal(row)
 
@@ -1492,7 +1508,7 @@ class IncidentRepository:
                     "VALUES ($1, $2, $3::jsonb)",
                     incident_id,
                     EventKind.ESCALATED.value,
-                    {"reason": reason, "epoch": epoch},
+                    redact_structure({"reason": reason, "epoch": epoch}),
                 )
         return _row_to_incident(row)
 

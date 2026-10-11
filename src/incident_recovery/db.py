@@ -252,12 +252,20 @@ INVESTIGATION_STEPS_CASCADE_FIX_SQL = """
 DROP RULE IF EXISTS investigation_steps_no_delete ON investigation_steps;
 """
 
+OPERATION_SCOPE_SQL = """
+-- Migration 6: record the reservation scope on the durable switch record so an
+-- exact replay can require an exact operation/scope/request match.  Existing
+-- rows predate the column and are treated as scope-agnostic (NULL).
+ALTER TABLE deployment_operations ADD COLUMN IF NOT EXISTS scope TEXT;
+"""
+
 MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, DEPLOYMENT_SCHEMA_SQL),
     (2, INCIDENT_SCHEMA_SQL),
     (3, RECOVERY_SCHEMA_SQL),
     (4, INVESTIGATION_SCHEMA_SQL),
     (5, INVESTIGATION_STEPS_CASCADE_FIX_SQL),
+    (6, OPERATION_SCOPE_SQL),
 )
 
 _ADVISORY_LOCK_KEY = 7762002

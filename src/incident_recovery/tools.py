@@ -73,65 +73,178 @@ def redact_secrets(text: str, *, extra: Iterable[str] = ()) -> str:
     return redacted
 
 
-def _encoded_size(payload: dict) -> int:
+def _is_sensitive_key(key: str) -> bool:
+    """True when a mapping key names a secret-shaped field (case/variant aware)."""
+
+    return re.search(_SENSITIVE_KEY, key, re.IGNORECASE) is not None
+
+
+def redact_structure(value, *, extra: Iterable[str] = ()):
+    """Recursively redact secret-shaped keys and secret values in a JSON tree.
+
+    A mapping key that names a secret (``password``, ``api_key``, ``token``, ...)
+    has its *entire* value replaced by the redaction marker, whatever the value
+    type.  String values and keys are additionally passed through
+    :func:`redact_secrets` so assignment-like text and configured secret values
+    are removed too.  Lists and nested mappings are walked recursively; other
+    scalars are preserved.  The input is never mutated.
+    """
+
+    if isinstance(value, dict):
+        cleaned: dict = {}
+        for key, item in value.items():
+            key_text = redact_secrets(str(key), extra=extra)
+            if _is_sensitive_key(str(key)):
+                cleaned[key_text] = _REDACTED
+            else:
+                cleaned[key_text] = redact_structure(item, extra=extra)
+        return cleaned
+    if isinstance(value, (list, tuple)):
+        return [redact_structure(item, extra=extra) for item in value]
+    if isinstance(value, str):
+        return redact_secrets(value, extra=extra)
+    return value
+
+
+def _encoded_size(payload) -> int:
     return len(json.dumps(payload, separators=(",", ":"), default=str).encode("utf-8"))
+
+
+def _truncate_string_within(value: str, budget: int) -> Optional[str]:
+    """Return the longest prefix of ``value`` (plus a marker) that fits ``budget``."""
+
+    if _encoded_size(value) <= budget:
+        return value
+    for suffix in ("[truncated]", ""):
+        low, high, best = 0, len(value), None
+        while low <= high:
+            mid = (low + high) // 2
+            candidate = value[:mid] + suffix
+            if _encoded_size(candidate) <= budget:
+                best = candidate
+                low = mid + 1
+            else:
+                high = mid - 1
+        if best is not None:
+            return best
+    return None
+
+
+def _fit(value, budget: int):
+    """Return a JSON-serializable copy of ``value`` within ``budget`` bytes.
+
+    Returns ``None`` only when even the smallest representation cannot fit, which
+    callers treat as "omit this entry".  Guaranteed to make progress: every
+    recursive call receives a strictly smaller budget.
+    """
+
+    if budget < 2:
+        return None
+    if _encoded_size(value) <= budget:
+        return value
+    if isinstance(value, dict):
+        return _fit_mapping(value, budget)
+    if isinstance(value, list):
+        return _fit_list(value, budget)
+    if isinstance(value, str):
+        return _truncate_string_within(value, budget)
+    return _truncate_string_within(str(value), budget)
+
+
+def _fit_mapping(value: dict, budget: int) -> dict:
+    result: dict = {}
+    used = 2  # braces
+    dropped = False
+    for key, item in value.items():
+        key_text = str(key)
+        entry_overhead = _encoded_size(key_text) + 1 + (1 if result else 0)
+        available = budget - used - entry_overhead
+        if available < 2:
+            dropped = True
+            break
+        fitted = _fit(item, available)
+        if fitted is None:
+            dropped = True
+            break
+        cost = _encoded_size(fitted)
+        if used + entry_overhead + cost > budget:
+            dropped = True
+            break
+        result[key_text] = fitted
+        used += entry_overhead + cost
+    if dropped:
+        marker_overhead = _encoded_size("truncated") + 1 + _encoded_size(True) + (1 if result else 0)
+        if used + marker_overhead <= budget:
+            result["truncated"] = True
+    while _encoded_size(result) > budget and result:
+        result.popitem()
+    return result
+
+
+def _fit_list(value: list, budget: int) -> list:
+    result: list = []
+    used = 2  # brackets
+    dropped = False
+    for item in value:
+        sep = 1 if result else 0
+        available = budget - used - sep
+        if available < 2:
+            dropped = True
+            break
+        fitted = _fit(item, available)
+        if fitted is None:
+            dropped = True
+            break
+        cost = _encoded_size(fitted)
+        if used + sep + cost > budget:
+            dropped = True
+            break
+        result.append(fitted)
+        used += sep + cost
+    if dropped:
+        marker = "[truncated]"
+        marker_cost = _encoded_size(marker) + (1 if result else 0)
+        if used + marker_cost <= budget:
+            result.append(marker)
+    while _encoded_size(result) > budget and result:
+        result.pop()
+    return result
 
 
 def _bounded_json(payload: dict, max_bytes: int = MAX_RESPONSE_BYTES) -> dict:
     """Return a copy of ``payload`` whose JSON encoding never exceeds ``max_bytes``.
 
-    A hostile workload can return an arbitrarily large log list or a single huge
-    string field.  A tool observation must still be persistable as bounded
-    evidence, so this shrinks the payload deterministically: it repeatedly halves
-    the largest list-valued field, then truncates the largest string, then drops
-    the largest remaining field, until the encoding fits.  The original mapping is
-    never mutated.
+    A hostile workload can return an arbitrarily large log list, a single huge
+    nested string, deep nesting, or multibyte values.  This shrinks the payload
+    deterministically and *always* returns something that fits the budget (for any
+    budget large enough to hold ``{}``): it walks the tree, truncating strings,
+    dropping list/mapping entries, and marking the result ``truncated``.  The
+    original mapping is never mutated.  A payload that already fits is returned
+    unchanged.
     """
 
     if _encoded_size(payload) <= max_bytes:
         return payload
 
-    trimmed: dict = dict(payload)
-    trimmed["truncated"] = True
-    for _ in range(512):
-        if _encoded_size(trimmed) <= max_bytes:
-            return trimmed
-        lists = [
-            (key, value)
-            for key, value in trimmed.items()
-            if isinstance(value, list) and len(value) > 0
-        ]
-        if lists:
-            key, value = max(lists, key=lambda item: _encoded_size({"v": item[1]}))
-            trimmed[key] = value[: max(1, len(value) // 2)]
-            continue
-        strings = [
-            (key, value)
-            for key, value in trimmed.items()
-            if isinstance(value, str) and key != "truncated"
-        ]
-        if strings:
-            key, value = max(strings, key=lambda item: len(item[1]))
-            overflow = _encoded_size(trimmed) - max_bytes
-            keep = max(0, len(value) - overflow - 64)
-            trimmed[key] = value[:keep] + "[truncated]"
-            continue
-        mappings = [
-            (key, value)
-            for key, value in trimmed.items()
-            if isinstance(value, dict) and len(value) > 0
-        ]
-        if mappings:
-            key, value = max(mappings, key=lambda item: _encoded_size({"v": item[1]}))
-            largest = max(value, key=lambda k: _encoded_size({"v": value[k]}))
-            del value[largest]
-            continue
-        candidates = [key for key in trimmed if key != "truncated"]
-        if not candidates:
-            return trimmed
-        key = max(candidates, key=lambda k: _encoded_size({"v": trimmed[k]}))
-        trimmed.pop(key, None)
-    return trimmed
+    # Reserve room for a top-level ``truncated`` marker so callers can tell the
+    # observation was reduced; drop it only when even that cannot fit.
+    marker_overhead = _encoded_size({"truncated": True}) - 1  # inner + comma
+    inner_budget = max_bytes - marker_overhead
+    fitted = _fit(payload, inner_budget) if inner_budget >= 2 else None
+    if not isinstance(fitted, dict):
+        fitted = {}
+    marked = dict(fitted)
+    marked["truncated"] = True
+    if _encoded_size(marked) <= max_bytes:
+        fitted = marked
+    # Final hard guarantee: never return a silently oversized payload.
+    if _encoded_size(fitted) > max_bytes:
+        fitted = _fit(payload, max_bytes)
+        if not isinstance(fitted, dict):
+            fitted = {}
+    if _encoded_size(fitted) > max_bytes:
+        fitted = {}
+    return fitted
 
 
 class ToolRunner:
@@ -177,7 +290,7 @@ class ToolRunner:
             evidence_id=uuid4(),
             tool=request.tool,
             observed_at=self._clock(),
-            summary=_bounded_json(payload, self._max_bytes),
+            summary=_bounded_json(redact_structure(payload), self._max_bytes),
         )
 
     async def collect(
@@ -247,11 +360,11 @@ class ToolRunner:
         rendered: list[dict] = []
         for entry in raw[:bounded_lines]:
             if isinstance(entry, dict):
-                rendered.append(
-                    {key: redact_secrets(str(value)) for key, value in entry.items()}
-                )
+                # Preserve nested structure so recursive redaction can walk it;
+                # redaction happens centrally in ``observe`` before bounding.
+                rendered.append(dict(entry))
             else:
-                rendered.append({"message": redact_secrets(str(entry))})
+                rendered.append({"message": str(entry)})
         return {
             "tool": "logs",
             "http_status": status,

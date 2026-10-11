@@ -13,6 +13,7 @@ is stubbed except the HTTP observation source, which is a MockTransport.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -23,11 +24,16 @@ import pytest
 from incident_recovery.agent import InvestigationAgent
 from incident_recovery.contracts import (
     Diagnosis,
+    SwitchDecision,
     SwitchRequest,
     ToolRequest,
 )
+from incident_recovery.executor import RecoveryExecutor
 from incident_recovery.gateway import DeploymentStore
 from incident_recovery.models import (
+    OPERATION_EXECUTED,
+    OPERATION_EXECUTING,
+    EventKind,
     EvidenceType,
     IncidentState,
     LeaseLost,
@@ -37,7 +43,7 @@ from incident_recovery.models import (
 from incident_recovery.repository import IncidentRepository
 from incident_recovery.tools import MAX_RESPONSE_BYTES, ToolRunner
 
-from .conftest import IntegrationDB
+from .conftest import IntegrationDB, RealSwitchClient
 
 BASE = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 HEALTHY = "healthy-v1"
@@ -301,3 +307,249 @@ async def test_expired_approval_is_refused_at_authoritative_switch(
     )
     assert decision.status == "unauthorized"
     assert (await store.get_snapshot()).revision == BROKEN
+
+
+# --- Finding 1: admission time must be refreshed after lock waits -------------
+
+
+async def test_switch_expiry_after_lock_wait_cannot_mutate(
+    test_db: IntegrationDB,
+) -> None:
+    """An approval that expires while the switch waits on the row lock is refused.
+
+    The authoritative admission time is read with ``clock_timestamp()`` *after*
+    the row lock is acquired, so a long lock wait cannot resurrect an expired
+    approval.  The switch must not mutate ``deployment_state``.
+    """
+
+    repo = IncidentRepository(test_db.pool)
+    store = DeploymentStore(test_db.pool)
+    incident, proposal = await _awaiting_incident_with_proposal(repo, store)
+    _, operation, _ = await repo.approve_incident(
+        incident.id, proposal.digest, "alice", ttl_seconds=1, now=utcnow()
+    )
+
+    holder = await test_db.pool.acquire()
+    tx = holder.transaction()
+    await tx.start()
+    try:
+        await holder.fetchrow(
+            "SELECT service_id FROM deployment_state WHERE service_id = $1 FOR UPDATE",
+            "demo-api",
+        )
+        switch_task = asyncio.create_task(
+            store.switch(
+                SwitchRequest(
+                    operation_id=operation.id,
+                    expected_generation=operation.expected_generation,
+                    target_revision=operation.target_revision,
+                    scope="recovery",
+                )
+            )
+        )
+        # Give the switch time to block on the lock, then outlive the 1s TTL.
+        await asyncio.sleep(0.2)
+        await asyncio.sleep(1.2)
+    finally:
+        await tx.rollback()
+        await test_db.pool.release(holder)
+
+    decision = await asyncio.wait_for(switch_task, timeout=10)
+    assert decision.status == "unauthorized"
+    assert (await store.get_snapshot()).revision == BROKEN
+    assert (
+        await repo.pool.fetchval(
+            "SELECT count(*) FROM deployment_operations WHERE operation_id = $1",
+            operation.id,
+        )
+        == 0
+    )
+
+
+# --- Finding 2: crash window reconciliation -----------------------------------
+
+
+async def _seed_durable_switch_without_execution(
+    repo: IncidentRepository, store: DeploymentStore
+) -> tuple[object, object]:
+    """Simulate a crash after the durable switch but before record_execution.
+
+    Test-side interruption only: the real gateway switch is applied (creating the
+    durable operation record), the approval is then expired, and no
+    ``record_execution`` is written.  No production debug hook is involved.
+    """
+
+    incident, proposal = await _awaiting_incident_with_proposal(repo, store)
+    approval, operation, _ = await repo.approve_incident(
+        incident.id, proposal.digest, "alice", ttl_seconds=300, now=utcnow()
+    )
+    assert await repo.consume_approval(approval.id, operation.id)
+    await repo.set_operation_status(operation.id, OPERATION_EXECUTING, bump_attempts=True)
+
+    decision = await store.switch(
+        SwitchRequest(
+            operation_id=operation.id,
+            expected_generation=operation.expected_generation,
+            target_revision=operation.target_revision,
+            scope="recovery",
+        )
+    )
+    assert decision.status == "applied"
+    assert (await store.get_snapshot()).revision == HEALTHY
+
+    # The process "died" here; the approval later expired.
+    await repo.pool.execute(
+        "UPDATE approvals SET expires_at = now() - interval '5 seconds' WHERE id = $1",
+        approval.id,
+    )
+    return incident, operation
+
+
+async def test_switch_replays_exact_durable_operation_after_expiry(
+    test_db: IntegrationDB,
+) -> None:
+    repo = IncidentRepository(test_db.pool)
+    store = DeploymentStore(test_db.pool)
+    _, operation = await _seed_durable_switch_without_execution(repo, store)
+    before = await store.get_snapshot()
+
+    replay = await store.switch(
+        SwitchRequest(
+            operation_id=operation.id,
+            expected_generation=operation.expected_generation,
+            target_revision=operation.target_revision,
+            scope="recovery",
+        )
+    )
+    assert replay.status == "replayed"
+    assert replay.snapshot.revision == HEALTHY
+    after = await store.get_snapshot()
+    assert after.generation == before.generation
+    assert (
+        await repo.pool.fetchval(
+            "SELECT count(*) FROM deployment_operations WHERE operation_id = $1",
+            operation.id,
+        )
+        == 1
+    )
+    assert (
+        await repo.pool.fetchval(
+            "SELECT count(*) FROM deployment_history WHERE operation_id = $1",
+            operation.id,
+        )
+        == 1
+    )
+
+
+async def test_switch_replay_requires_exact_scope(test_db: IntegrationDB) -> None:
+    """A scope mismatch is not an exact replay and cannot be blessed."""
+
+    repo = IncidentRepository(test_db.pool)
+    store = DeploymentStore(test_db.pool)
+    _, operation = await _seed_durable_switch_without_execution(repo, store)
+
+    mismatched = await store.switch(
+        SwitchRequest(
+            operation_id=operation.id,
+            expected_generation=operation.expected_generation,
+            target_revision=operation.target_revision,
+            scope="fault",
+        )
+    )
+    assert mismatched.status != "replayed"
+    assert mismatched.status != "applied"
+
+
+async def test_executor_reconciles_durable_operation_on_resume(
+    test_db: IntegrationDB,
+) -> None:
+    repo = IncidentRepository(test_db.pool)
+    store = DeploymentStore(test_db.pool)
+    _, operation = await _seed_durable_switch_without_execution(repo, store)
+
+    # A later executor run (long after expiry) must reconcile, not fail closed.
+    executor = RecoveryExecutor(
+        repo,
+        RealSwitchClient(store),
+        store,
+        clock=lambda: BASE + timedelta(days=1),
+    )
+    result = await executor.execute(operation.id)
+    assert result.status == OPERATION_EXECUTED
+    assert (await store.get_snapshot()).revision == HEALTHY
+    assert (await repo.get_operation(operation.id)).status == OPERATION_EXECUTED
+
+
+class _RejectingButAppliedClient:
+    """Applies the switch, then reports a rejected (lost-response) decision."""
+
+    def __init__(self, store: DeploymentStore) -> None:
+        self._store = store
+
+    async def switch(self, *, operation_id, expected_generation, target_revision, scope):
+        decision = await self._store.switch(
+            SwitchRequest(
+                operation_id=operation_id,
+                expected_generation=expected_generation,
+                target_revision=target_revision,
+                scope=scope,
+            )
+        )
+        assert decision.status == "applied"
+        return SwitchDecision(status="unauthorized", snapshot=decision.snapshot)
+
+
+async def test_executor_reconciles_when_switch_response_rejected(
+    test_db: IntegrationDB,
+) -> None:
+    repo = IncidentRepository(test_db.pool)
+    store = DeploymentStore(test_db.pool)
+    incident, proposal = await _awaiting_incident_with_proposal(repo, store)
+    _, operation, _ = await repo.approve_incident(
+        incident.id, proposal.digest, "alice", ttl_seconds=300, now=utcnow()
+    )
+
+    executor = RecoveryExecutor(
+        repo,
+        _RejectingButAppliedClient(store),
+        store,
+        clock=lambda: BASE,
+    )
+    result = await executor.execute(operation.id)
+    assert result.status == OPERATION_EXECUTED
+    assert (await store.get_snapshot()).revision == HEALTHY
+
+
+# --- Finding 4: redaction at the repository persistence boundary --------------
+
+
+async def test_repository_redacts_nested_secrets_at_persistence(
+    test_db: IntegrationDB,
+) -> None:
+    repo = IncidentRepository(test_db.pool)
+    incident, _ = await repo.ingest_alert(f"redact-{uuid.uuid4()}", "demo-api", "x", {})
+    sentinel = "SYNTHETIC_SENTINEL"
+
+    evidence = await repo.append_evidence(
+        incident.id,
+        "tool:metrics",
+        EvidenceType.METRIC,
+        {
+            "password": sentinel,
+            "nested": {"deeper": {"password": sentinel}},
+            "list": [{"token": sentinel}],
+            "revision": "broken-v2",
+        },
+    )
+    assert evidence.payload["nested"]["deeper"]["password"] == "[REDACTED]"
+    assert evidence.payload["list"][0]["token"] == "[REDACTED]"
+    assert evidence.payload["revision"] == "broken-v2"
+
+    event = await repo.append_event(
+        incident.id, EventKind.EVIDENCE_RECORDED, {"api_key": sentinel, "ok": 1}
+    )
+    assert sentinel not in json.dumps(event.payload)
+    assert event.payload["ok"] == 1
+
+    rows = await repo.list_evidence(incident.id)
+    assert sentinel not in json.dumps([row.payload for row in rows])

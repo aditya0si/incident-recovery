@@ -85,6 +85,15 @@ class RecoveryExecutor:
         if operation.status in (OPERATION_EXECUTED, "verified", OPERATION_FAILED):
             return operation
 
+        # Crash-window reconciliation: if the durable switch already committed
+        # for this exact operation (the process died after the gateway mutation
+        # but before record_execution), record the execution now instead of
+        # re-admitting it under a fresh approval.  An expired/consumed approval
+        # must never block reconciliation of a mutation that actually happened.
+        reconciled = await self._reconcile_exact(operation_id, operation)
+        if reconciled is not None:
+            return reconciled
+
         reservation = await self._repo.get_reservation(operation_id)
         if reservation is None or reservation.status != "active":
             return await self._fail(operation_id, "no_active_reservation")
@@ -132,27 +141,55 @@ class RecoveryExecutor:
                     "generation": decision.snapshot.generation,
                 },
             )
+        # The switch rejected the request.  If, despite that, the durable record
+        # proves this exact operation already applied, reconcile it rather than
+        # reporting a false failure (e.g. a lost response).
+        reconciled = await self._reconcile_exact(operation_id)
+        if reconciled is not None:
+            return reconciled
         if decision.status == "stale":
             return await self._fail(operation_id, "stale_revision")
         return await self._fail(operation_id, f"switch_{decision.status}")
+
+    async def _reconcile_exact(
+        self, operation_id: UUID, operation: Optional[Operation] = None
+    ) -> Optional[Operation]:
+        """Reconcile only an exact durable operation/scope/request match.
+
+        Returns the reconciled operation, or ``None`` when there is no durable
+        record or it does not exactly match this operation (so a revision that
+        merely happens to be active can never manufacture success).
+        """
+        record = await self._store.get_operation_record(operation_id)
+        if record is None:
+            return None
+        if operation is None:
+            operation = await self._repo.get_operation(operation_id)
+        if operation is None:
+            return None
+        if (
+            record.service_id != operation.service_id
+            or record.expected_generation != operation.expected_generation
+            or record.target_revision != operation.target_revision
+            or record.scope != "recovery"
+        ):
+            return None
+        return await self._repo.record_execution(
+            operation_id,
+            {
+                "status": "reconciled",
+                "revision": record.snapshot.revision,
+                "generation": record.snapshot.generation,
+            },
+        )
 
     async def _reconcile_after_ambiguity(
         self, operation_id: UUID, exc: BaseException
     ) -> Operation:
         """Reconcile by the durable operation record; never blind-retry."""
-        record = await self._store.get_operation_record(operation_id)
-        operation = await self._repo.get_operation(operation_id)
-        if record is not None and operation is not None:
-            if record.target_revision != operation.target_revision:
-                return await self._fail(operation_id, "reconcile_conflict")
-            return await self._repo.record_execution(
-                operation_id,
-                {
-                    "status": "reconciled",
-                    "revision": record.snapshot.revision,
-                    "generation": record.snapshot.generation,
-                },
-            )
+        reconciled = await self._reconcile_exact(operation_id)
+        if reconciled is not None:
+            return reconciled
         # The mutation is not confirmed.  Leave the operation pending so a later
         # claim retries the idempotent switch under the same operation id.
         return await self._repo.set_operation_status(

@@ -78,7 +78,14 @@ class GatewayFunctionalProbe:
             return FunctionalCheck(False, None, f"snapshot_unreachable:{exc.__class__.__name__}", now)
         if snapshot_response.status_code != 200:
             return FunctionalCheck(False, None, f"snapshot_status:{snapshot_response.status_code}", now)
-        revision = snapshot_response.json().get("revision")
+        try:
+            snapshot = snapshot_response.json()
+        except ValueError:
+            snapshot = {}
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+        revision = snapshot.get("revision")
+        generation = snapshot.get("generation")
         if revision != target_revision:
             return FunctionalCheck(False, revision, "revision_mismatch", now)
 
@@ -86,10 +93,34 @@ class GatewayFunctionalProbe:
             health_response = await self._client.get("/api/health", timeout=self._timeout)
         except httpx.HTTPError as exc:
             return FunctionalCheck(False, revision, f"health_unreachable:{exc.__class__.__name__}", now)
+
+        # The gateway stamps the authoritative deployment identity on every
+        # proxied response.  Require the health response's own identity headers
+        # to match the intended revision and the snapshot generation, so an
+        # independent snapshot or an unrelated success can never be blessed.
+        # Missing or malformed identity fails closed.
+        header_revision = health_response.headers.get("X-Deployment-Revision")
+        header_generation = health_response.headers.get("X-Deployment-Generation")
+        if header_revision != target_revision:
+            return FunctionalCheck(False, revision, "health_identity_revision_mismatch", now)
+        if header_generation is None or not str(header_generation).strip().isdigit():
+            return FunctionalCheck(False, revision, "health_identity_generation_invalid", now)
+        try:
+            generation_matches = generation is not None and int(header_generation) == int(generation)
+        except (TypeError, ValueError):
+            generation_matches = False
+        if not generation_matches:
+            return FunctionalCheck(False, revision, "health_identity_generation_mismatch", now)
+
         try:
             body = health_response.json()
         except ValueError:
             body = {}
+        if not isinstance(body, dict):
+            return FunctionalCheck(False, revision, "health_body_not_object", now)
+        body_revision = body.get("revision")
+        if body_revision is not None and body_revision != target_revision:
+            return FunctionalCheck(False, revision, "health_body_revision_mismatch", now)
         healthy = health_response.status_code == 200 and body.get("status") == "pass"
         detail = "functional_pass" if healthy else f"functional_fail:{health_response.status_code}"
         return FunctionalCheck(healthy, revision, detail, now)
@@ -128,19 +159,45 @@ class RecoveryVerifier:
         reason = "deadline_exceeded"
 
         while True:
+            # Never start a probe once the deadline has passed.
+            if self._elapsed(started) >= self._deadline_seconds:
+                reason = "deadline_exceeded"
+                break
             if heartbeat is not None:
                 await heartbeat()
-            check = await self._probe.check(target_revision)
+            # Bound the probe by the remaining deadline: a slow probe can never
+            # run past the deadline and then report a late success.
+            remaining = self._deadline_seconds - self._elapsed(started)
+            if remaining <= 0:
+                reason = "deadline_exceeded"
+                break
+            try:
+                check = await asyncio.wait_for(
+                    self._probe.check(target_revision), timeout=remaining
+                )
+            except asyncio.TimeoutError:
+                checks.append(
+                    FunctionalCheck(
+                        ok=False, revision=None, detail="deadline_exceeded", at=self._clock()
+                    )
+                )
+                reason = "deadline_exceeded"
+                break
             checks.append(check)
+            # Strict elapsed semantics: a probe that completed *after* the
+            # deadline can never contribute to a successful streak.
+            if self._elapsed(started) > self._deadline_seconds:
+                success = False
+                reason = "deadline_exceeded"
+                break
             streak = streak + 1 if check.ok else 0
             if streak >= self._required_streak:
                 success = True
                 reason = "verified"
                 break
-            if self._elapsed(started) >= self._deadline_seconds:
-                break
             await self._sleep(self._interval)
             if self._elapsed(started) >= self._deadline_seconds:
+                reason = "deadline_exceeded"
                 break
 
         finished = self._clock()
