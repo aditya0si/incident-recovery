@@ -1,0 +1,191 @@
+{
+  "schema": "incident-recovery/staging-verify-report/v1",
+  "source": {
+    "sha": "ffa8a3f6cda8abae6a0d7dee493d17d1e5ccd781",
+    "branch": "feat/incident-recovery",
+    "dirty": false,
+    "pinned_source_sha": "a6f715aac1d4e46b2ef30e12fb42d4719672f7f5",
+    "archive": ".hermes/tenant-api-a6f715a.tar",
+    "archive_sha256": "3837fb8bf2bf06080af068a75a6cfd2e22d1f4e15e5b104b73dacd015c5ca48c",
+    "manifest_hash": "e8614c28d44cd789d5ea53e97df20c5ac033fc142a48d939acbf098c42eb8da3",
+    "fault_patch_sha256": "644c758d35d4edccf62db2200c5511fac79bda518232ea2b8e13cbae0bc6036f",
+    "fault_patch_path": "staging\\faults\\broken-revision.patch"
+  },
+  "started_at": "2026-10-12T01:59:16.339271+00:00",
+  "finished_at": "2026-10-12T02:09:40.081142+00:00",
+  "totals": {
+    "passed": 17,
+    "failed": 0,
+    "blocked": 0
+  },
+  "readiness_claim": "staging integration verified; live-readiness blocked (no live model run). Not a production-readiness claim.",
+  "live_readiness_status": "blocked",
+  "checks": [
+    {
+      "name": "staging_source_materialize",
+      "gate": "staging_integration",
+      "category": "required",
+      "status": "passed",
+      "exit_code": 0,
+      "detail": "pinned snapshot materialized (hash/commit bound)",
+      "counts": {}
+    },
+    {
+      "name": "staging_fault_prepare",
+      "gate": "staging_integration",
+      "category": "required",
+      "status": "passed",
+      "exit_code": 0,
+      "detail": "isolated faulty build copy materialized",
+      "counts": {}
+    },
+    {
+      "name": "staging_offline_tests",
+      "gate": "staging_integration",
+      "category": "required",
+      "status": "passed",
+      "exit_code": 0,
+      "detail": "226 passed (+1 opt-in skip run separately)",
+      "counts": {
+        "passed": 226,
+        "skipped": 1
+      }
+    },
+    {
+      "name": "staging_e2e_baseline",
+      "gate": "staging_integration",
+      "category": "required",
+      "status": "passed",
+      "exit_code": 0,
+      "detail": "1 passed",
+      "counts": {
+        "passed": 1
+      }
+    },
+    {
+      "name": "staging_recovery",
+      "gate": "staging_integration",
+      "category": "required",
+      "status": "passed",
+      "exit_code": 0,
+      "detail": "real approved recovery + dependency refusal",
+      "counts": {}
+    },
+    {
+      "name": "staging_evaluation_scripted",
+      "gate": "staging_integration",
+      "category": "required",
+      "status": "passed",
+      "exit_code": 0,
+      "detail": "12/12 scripted cases executed",
+      "counts": {}
+    },
+    {
+      "name": "staging_evaluation_live_blocked",
+      "gate": "live_readiness",
+      "category": "expected_blocked",
+      "status": "passed",
+      "exit_code": 0,
+      "detail": "12 blocked / 0 executed / 0 provider requests (expected)",
+      "counts": {}
+    },
+    {
+      "name": "provider_gate_blocked",
+      "gate": "provider_blocked",
+      "category": "required",
+      "status": "passed",
+      "exit_code": null,
+      "detail": "provider=opencode-go scope=runtime:incident-investigation status=blocked",
+      "counts": {}
+    },
+    {
+      "name": "demo_regression_verify",
+      "gate": "demo_regression",
+      "category": "required",
+      "status": "passed",
+      "exit_code": 0,
+      "detail": "full verify.py --docker --ui passed",
+      "counts": {}
+    },
+    {
+      "name": "restore_demo_default",
+      "gate": "environment_restore",
+      "category": "required",
+      "status": "passed",
+      "exit_code": 0,
+      "detail": "exit 0",
+      "counts": {}
+    },
+    {
+      "name": "restore_staging_default",
+      "gate": "environment_restore",
+      "category": "required",
+      "status": "passed",
+      "exit_code": 0,
+      "detail": "exit 0",
+      "counts": {}
+    },
+    {
+      "name": "evidence_baseline_report",
+      "gate": "staging_integration",
+      "category": "required",
+      "status": "passed",
+      "exit_code": null,
+      "detail": "status=passed checks=25 failed=0 source_sha=a6f715aac1d4e46b2ef30e12fb42d4719672f7f5",
+      "counts": {}
+    },
+    {
+      "name": "evidence_recovery_report",
+      "gate": "staging_integration",
+      "category": "required",
+      "status": "passed",
+      "exit_code": null,
+      "detail": "status=passed checks=20/20 patch=644c758d35d4edccf62db2200c5511fac79bda518232ea2b8e13cbae0bc6036f live_provider=blocked",
+      "counts": {}
+    },
+    {
+      "name": "evidence_scripted_evaluation",
+      "gate": "staging_integration",
+      "category": "required",
+      "status": "passed",
+      "exit_code": null,
+      "detail": "status=passed passed=12/12 recoveries=2 refusals=10 cleanup_failures=0 safety_established=True utility=orchestration",
+      "counts": {}
+    },
+    {
+      "name": "evidence_live_blocked",
+      "gate": "live_readiness",
+      "category": "required",
+      "status": "passed",
+      "exit_code": null,
+      "detail": "status=blocked blocked=12/12 executed=0 safety_ok=None transport=False",
+      "counts": {}
+    },
+    {
+      "name": "evidence_scripted_cases",
+      "gate": "staging_integration",
+      "category": "required",
+      "status": "passed",
+      "exit_code": null,
+      "detail": "12 case records honored (scripted-executed; usage=None, transport=False)",
+      "counts": {}
+    },
+    {
+      "name": "evidence_live_cases",
+      "gate": "live_readiness",
+      "category": "required",
+      "status": "passed",
+      "exit_code": null,
+      "detail": "12 case records honored (live-blocked; usage=None, transport=False)",
+      "counts": {}
+    }
+  ],
+  "gates": {
+    "staging_integration": "passed",
+    "demo_regression": "passed",
+    "live_readiness": "blocked",
+    "provider_blocked": "blocked",
+    "environment_restore": "passed"
+  },
+  "note": "Sanitized projection of the independent local run; raw logs and runtime secrets are excluded. This is not a fresh-checkout CI result."
+}
