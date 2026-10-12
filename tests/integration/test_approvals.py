@@ -20,6 +20,7 @@ from incident_recovery.executor import RecoveryExecutor
 from incident_recovery.gateway import DeploymentStore
 from incident_recovery.models import (
     OPERATION_EXECUTED,
+    OPERATION_EXECUTING,
     OPERATION_FAILED,
     IncidentState,
     ReservationConflict,
@@ -399,6 +400,69 @@ async def test_executor_rechecks_dependencies_after_admission_before_switch(
     assert result.status == OPERATION_FAILED
     assert result.last_error == "dependencies_unhealthy"
     assert calls["n"] == 2, "the dependency must be re-observed after admission"
+    assert client.calls == [], "no switch may run once the dependency has flipped"
+    assert (await store.get_snapshot()).revision == BROKEN
+    # The admission step consumed the approval before the flip was observed.
+    approval = await repo.get_approval_for_incident(incident.id)
+    assert approval is not None and approval.consumed_by_operation == operation.id
+
+
+class _FlipDependencyAfterStatusWrite:
+    """A repo proxy that flips an external dependency during the EXECUTING write.
+
+    It reproduces the parent's status-write-flip shape: the pre-admission
+    attestation observes a healthy dependency, but the dependency turns unhealthy
+    during the awaited ``set_operation_status(OPERATION_EXECUTING)`` round-trip.
+    """
+
+    def __init__(self, repo: IncidentRepository, flip) -> None:
+        self._repo = repo
+        self._flip = flip
+
+    def __getattr__(self, name):
+        return getattr(self._repo, name)
+
+    async def set_operation_status(self, operation_id, status, **kwargs):
+        result = await self._repo.set_operation_status(operation_id, status, **kwargs)
+        if status == OPERATION_EXECUTING:
+            self._flip()
+        return result
+
+
+async def test_executor_rechecks_dependencies_after_status_write_before_switch(
+    repo: IncidentRepository, store: DeploymentStore
+) -> None:
+    """A dependency that fails during the executing-status write still refuses.
+
+    Reproduces the parent's status-write-flip shape: the pre-admission attestation
+    observes a healthy dependency, but the dependency turns unhealthy during the
+    awaited ``set_operation_status(OPERATION_EXECUTING)`` write.  Because the final
+    bounded attestation now runs *after* that write and immediately before the
+    switch, the mutation is refused and recorded failed.
+    """
+
+    incident, proposal = await _awaiting_incident_with_proposal(repo, store)
+    _, operation, _ = await repo.approve_incident(
+        incident.id, proposal.digest, "alice", now=utcnow()
+    )
+
+    state = {"flipped": False}
+
+    async def healthy_until_flip() -> bool:
+        return not state["flipped"]
+
+    def flip() -> None:
+        state["flipped"] = True
+
+    proxied = _FlipDependencyAfterStatusWrite(repo, flip)
+    client = _store_client(store)
+    executor = RecoveryExecutor(
+        proxied, client, store, clock=lambda: BASE, dependency_check=healthy_until_flip
+    )
+    result = await executor.execute(operation.id)
+    assert result.status == OPERATION_FAILED
+    assert result.last_error == "dependencies_unhealthy"
+    assert state["flipped"] is True
     assert client.calls == [], "no switch may run once the dependency has flipped"
     assert (await store.get_snapshot()).revision == BROKEN
     # The admission step consumed the approval before the flip was observed.

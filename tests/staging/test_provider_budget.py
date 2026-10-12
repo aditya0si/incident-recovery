@@ -709,3 +709,81 @@ def test_missing_ledger_initializes_a_new_batch_and_can_admit(tmp_path: Path) ->
     assert ledger.admit_smoke().allowed is True
     assert path.is_file()
 
+
+# --- round3: duplicate JSON keys fail closed at every object level -------------
+
+
+def _inject_duplicate(payload: str, needle: str, replacement: str) -> str:
+    assert payload.count(needle) == 1, (needle, payload)
+    return payload.replace(needle, replacement)
+
+
+def test_duplicate_root_billing_refused_latch_cannot_be_cleared(tmp_path: Path) -> None:
+    # A completed valid ledger that latches a billing refusal, plus a *later*
+    # duplicate ``billing_refused:false``.  json.loads would keep the last value
+    # and silently clear the latch (and admit a smoke call); the strict reader
+    # must refuse the whole record instead.
+    compact = json.dumps(
+        _valid_state(billing_refused=True), separators=(",", ":")
+    )
+    payload = _inject_duplicate(
+        compact,
+        '"billing_refused":true',
+        '"billing_refused":true,"billing_refused":false',
+    )
+    path = tmp_path / "provider_budget.json"
+    original = _write_raw(path, payload)
+    with pytest.raises(policy.ProviderPolicyError):
+        policy.JsonBudgetLedger(path)
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_duplicate_nested_counter_key_is_rejected(tmp_path: Path) -> None:
+    compact = json.dumps(_valid_state(), separators=(",", ":"))
+    payload = _inject_duplicate(compact, '"turns":{"a":2}', '"turns":{"a":2,"a":2}')
+    path = tmp_path / "provider_budget.json"
+    original = _write_raw(path, payload)
+    with pytest.raises(policy.ProviderPolicyError):
+        policy.JsonBudgetLedger(path)
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_duplicate_nested_usage_key_is_rejected(tmp_path: Path) -> None:
+    compact = json.dumps(_valid_state(), separators=(",", ":"))
+    payload = _inject_duplicate(
+        compact, '"input_tokens":5', '"input_tokens":5,"input_tokens":5'
+    )
+    path = tmp_path / "provider_budget.json"
+    original = _write_raw(path, payload)
+    with pytest.raises(policy.ProviderPolicyError):
+        policy.JsonBudgetLedger(path)
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_duplicate_key_in_migratable_v2_ledger_is_rejected(tmp_path: Path) -> None:
+    legacy = _valid_state(billing_refused=True)
+    legacy.pop("smoke_pending")
+    legacy["schema"] = 2
+    compact = json.dumps(legacy, separators=(",", ":"))
+    payload = _inject_duplicate(
+        compact,
+        '"billing_refused":true',
+        '"billing_refused":true,"billing_refused":false',
+    )
+    path = tmp_path / "provider_budget.json"
+    original = _write_raw(path, payload)
+    with pytest.raises(policy.ProviderPolicyError):
+        policy.JsonBudgetLedger(path)
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_unique_key_ledger_still_loads_and_retains_the_latch(tmp_path: Path) -> None:
+    # Control: the same record without any duplicate key is accepted unchanged.
+    path = tmp_path / "provider_budget.json"
+    path.write_text(
+        json.dumps(_valid_state(billing_refused=True)), encoding="utf-8"
+    )
+    ledger = policy.JsonBudgetLedger(path)
+    assert ledger.billing_refused() is True
+    assert ledger.snapshot()["turns"]["a"] == 2
+

@@ -138,19 +138,22 @@ class RecoveryExecutor:
         if not consumed:
             return await self._fail(operation_id, "approval_consumed")
 
-        # Repeat the bounded fresh attestation *after* admission and immediately
-        # before the mutation: a dependency that failed while the approval was
-        # being consumed (an awaited, network/DB round-trip) must still refuse the
-        # switch.  External dependency health cannot be observed atomically with
-        # the switch, so this is a conservative pre-action check, not a claim of
-        # simultaneous atomicity; a change after this observation can still only
-        # be caught by post-action verification.
-        if not await _dependencies_healthy():
-            return await self._fail(operation_id, "dependencies_unhealthy")
-
+        # Record the executing state first so that every controllable awaited
+        # admission/status write completes before the final attestation.  The
+        # bounded fresh attestation then runs *last*, immediately before the
+        # mutation: a dependency that failed while the approval was being consumed
+        # (an awaited network/DB round-trip) *or* during the awaited executing
+        # status write is still observed, so the switch is refused.  External
+        # dependency health cannot be observed atomically with the switch, so this
+        # remains a conservative pre-action check, not a claim of simultaneous
+        # atomicity; a change after this observation can still only be caught by
+        # post-action verification.
         await self._repo.set_operation_status(
             operation_id, OPERATION_EXECUTING, bump_attempts=True
         )
+
+        if not await _dependencies_healthy():
+            return await self._fail(operation_id, "dependencies_unhealthy")
 
         try:
             decision = await self._switch.switch(

@@ -532,6 +532,23 @@ def _validate_state(data: Any, *, limits: ProviderLimits) -> dict:
     return state
 
 
+def _reject_duplicate_keys(pairs: list) -> dict:
+    """``object_pairs_hook`` that refuses a duplicate key at *every* object level.
+
+    ``json.loads`` otherwise silently keeps the last value of a duplicated key,
+    which would let a crafted ledger order a latched ``billing_refused`` before a
+    trailing ``false`` and clear the latch.  The hook is invoked for each JSON
+    object (root and nested), so a duplicate anywhere fails closed.
+    """
+
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise ProviderPolicyError("provider_budget_ledger_duplicate_key")
+        result[key] = value
+    return result
+
+
 def _ledger_key(incident_id: Any) -> str:
     return SMOKE_KEY if incident_id is None else str(incident_id)
 
@@ -672,7 +689,10 @@ class JsonBudgetLedger:
         if not self._path.is_file():
             return _empty_state()
         try:
-            data = json.loads(self._path.read_text(encoding="utf-8"))
+            data = json.loads(
+                self._path.read_text(encoding="utf-8"),
+                object_pairs_hook=_reject_duplicate_keys,
+            )
         except (OSError, ValueError) as exc:
             raise ProviderPolicyError("provider_budget_ledger_unreadable") from exc
         return _validate_state(data, limits=self._limits)
