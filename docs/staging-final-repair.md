@@ -32,6 +32,14 @@ Execution-time recheck: `RecoveryExecutor` accepts an optional
 is failed with `dependencies_unhealthy` **before** the approval is consumed, so
 no rollback runs and the approval remains intact.
 
+**Round-2 refinement.** The check is *repeated* after the approval is consumed
+and immediately before the mutation, so a dependency that fails during the
+awaited admission round-trip still refuses the switch (see
+[staging-repair-round2.md](staging-repair-round2.md)).  External dependency
+health cannot be observed atomically with the switch; this is a timestamped,
+conservative pre-action observation, and a change after the last observation can
+only be caught by post-action verification.
+
 Evidence (mock gate): `tests/staging/test_staging_gate.py` (uncited-outage,
 contradiction, order-independence, missing-attestation, healthy control).
 Evidence (real PostgreSQL): `tests/integration/test_approvals.py::

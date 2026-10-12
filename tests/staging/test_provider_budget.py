@@ -25,6 +25,7 @@ import pytest
 from incident_recovery import provider_policy as policy
 from incident_recovery.contracts import InvestigationContext
 from incident_recovery.model_adapter import OpenAICompatibleAdapter
+from incident_recovery.models import ModelUnavailable
 
 BASE_URL = "http://provider.test/v1"
 SYNTHETIC_KEY = "sk-staging-SYNTHETIC-0123456789abcdef"
@@ -424,4 +425,287 @@ def test_multiprocess_concurrent_admission_is_serialized(tmp_path: Path) -> None
     snapshot = policy.JsonBudgetLedger(path, limits=limits).snapshot()
     assert len(snapshot["admitted"]) == 1
     assert snapshot["active_investigation"] == snapshot["admitted"][0]
+
+
+# --- round2: one-shot smoke admission -----------------------------------------
+
+
+def test_smoke_admission_is_single_use(tmp_path: Path) -> None:
+    ledger = _ledger(tmp_path)
+    assert ledger.admit_smoke().allowed is True
+    assert ledger.consume_smoke().allowed is True
+    second = ledger.consume_smoke()
+    assert second.allowed is False
+    assert second.reason == "smoke_already_consumed"
+
+
+def test_smoke_consume_before_admit_is_refused(tmp_path: Path) -> None:
+    ledger = _ledger(tmp_path)
+    refused = ledger.consume_smoke()
+    assert refused.allowed is False
+    assert refused.reason == "smoke_not_admitted"
+
+
+def test_smoke_turns_and_attempts_are_capped_at_one(tmp_path: Path) -> None:
+    ledger = _ledger(tmp_path)
+    assert ledger.begin_turn(None).allowed is True
+    second_turn = ledger.begin_turn(None)
+    assert second_turn.allowed is False
+    assert second_turn.reason == "turn_limit"
+    assert ledger.begin_attempt(None).allowed is True
+    second_attempt = ledger.begin_attempt(None)
+    assert second_attempt.allowed is False
+    assert second_attempt.reason == "attempt_limit"
+
+
+async def test_one_admitted_smoke_permits_exactly_one_transport(tmp_path: Path) -> None:
+    calls: list[httpx.Request] = []
+    ledger = _ledger(tmp_path)
+    adapter, provider_policy = _adapter(tmp_path, _ok_handler(calls), ledger=ledger)
+    assert provider_policy.admit_smoke().allowed is True
+    await adapter.next_step(None)
+    assert len(calls) == 1
+    # Two further attempts (the parent's reproduced shape) must not reach transport.
+    for _ in range(2):
+        with pytest.raises(policy.ProviderBudgetExceeded):
+            await adapter.next_step(None)
+    assert len(calls) == 1, "one smoke admission may authorize at most one transport"
+    snapshot = provider_policy.snapshot()
+    assert snapshot["smoke_calls"] == 1
+    assert snapshot["turns"][policy.SMOKE_KEY] == 1
+    assert snapshot["attempts"][policy.SMOKE_KEY] == 1
+    await adapter.aclose()
+
+
+async def test_consumed_smoke_permission_is_not_reusable_across_instances(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "provider_budget.json"
+    first = policy.JsonBudgetLedger(path)
+    adapter_a, policy_a = _adapter(tmp_path, _ok_handler([]), ledger=first)
+    assert policy_a.admit_smoke().allowed is True
+    await adapter_a.next_step(None)
+    await adapter_a.aclose()
+
+    # A fresh "process" over the same durable ledger must see the permission is
+    # already consumed and refuse before transport.
+    resumed_calls: list[httpx.Request] = []
+    second = policy.JsonBudgetLedger(path)
+    adapter_b, _ = _adapter(tmp_path, _ok_handler(resumed_calls), ledger=second)
+    with pytest.raises(policy.ProviderBudgetExceeded):
+        await adapter_b.next_step(None)
+    assert resumed_calls == []
+    await adapter_b.aclose()
+
+
+async def test_smoke_is_never_retried(tmp_path: Path) -> None:
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(503, json={"error": "busy"})
+
+    ledger = _ledger(tmp_path)
+    adapter, provider_policy = _adapter(tmp_path, handler, ledger=ledger, max_retries=5)
+    provider_policy.admit_smoke()
+    with pytest.raises(ModelUnavailable):
+        await adapter.next_step(None)
+    assert calls["n"] == 1, "a smoke call must never be retried automatically"
+    await adapter.aclose()
+
+
+# --- round2: billing latch rechecked inside each attempt -----------------------
+
+
+async def test_billing_latch_between_attempts_refuses_before_second_request(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "provider_budget.json"
+    ledger = policy.JsonBudgetLedger(path)
+    # A *different* ledger instance (as another process would hold) latches the
+    # refusal while this adapter is sleeping between attempts.
+    other_instance = policy.JsonBudgetLedger(path)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(500, json={"error": "server"})
+
+    async def sleep(_seconds: float) -> None:
+        other_instance.mark_billing_refused("provider_billing_refusal_402")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url=BASE_URL)
+    provider_policy = policy.StagingProviderPolicy(
+        eligibility=_reviewed_eligibility(), ledger=ledger
+    )
+    adapter = OpenAICompatibleAdapter(
+        base_url=BASE_URL,
+        model="deepseek-v4.1-flash",
+        api_key=SYNTHETIC_KEY,
+        client=client,
+        max_retries=3,
+        sleep=sleep,
+        policy=provider_policy,
+    )
+    incident_id = uuid4()
+    provider_policy.admit_investigation(incident_id)
+    with pytest.raises(policy.ProviderBillingRefusal):
+        await adapter.next_step(_context(incident_id))
+    assert calls["n"] == 1, "a latch applied between attempts must stop the retry"
+    await adapter.aclose()
+
+
+def test_multiprocess_transport_is_serialized(tmp_path: Path) -> None:
+    """Two real OS processes must hold the cross-process transport lock serially."""
+
+    import subprocess
+    import sys
+
+    path = tmp_path / "provider_budget.json"
+    log = tmp_path / "transport.log"
+    incident = "11111111-1111-1111-1111-111111111111"
+    code = (
+        "import sys, json, time, asyncio, httpx\n"
+        "from datetime import datetime, timezone\n"
+        "from uuid import UUID\n"
+        "from incident_recovery import provider_policy as p\n"
+        "from incident_recovery.model_adapter import OpenAICompatibleAdapter\n"
+        "from incident_recovery.contracts import InvestigationContext\n"
+        "path, log = sys.argv[1], sys.argv[2]\n"
+        "elig = p.ProviderEligibility(provider=p.GO_PROVIDER, scope=p.GO_RUNTIME_SCOPE,\n"
+        "    status='verified', source=p.OFFICIAL_DOC_URL,\n"
+        "    checked_at=datetime(2026,10,12,tzinfo=timezone.utc),\n"
+        "    evidence=p.EligibilityEvidence(scope=p.GO_RUNTIME_SCOPE, reviewer='r',\n"
+        "        reference='ref', reviewed_at=datetime(2026,10,12,tzinfo=timezone.utc)))\n"
+        "led = p.JsonBudgetLedger(path)\n"
+        "pol = p.StagingProviderPolicy(eligibility=elig, ledger=led)\n"
+        "inc = UUID(sys.argv[3])\n"
+        "pol.admit_investigation(inc)\n"
+        "def handler(request):\n"
+        "    with open(log, 'a') as f:\n"
+        "        f.write('enter %s\\n' % time.time())\n"
+        "    time.sleep(0.6)\n"
+        "    with open(log, 'a') as f:\n"
+        "        f.write('exit %s\\n' % time.time())\n"
+        "    content = json.dumps({'tool': 'health', 'reason': 'check'})\n"
+        "    return httpx.Response(200, json={'choices': [{'message': {'content': content}}]})\n"
+        "client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url='http://provider.test/v1')\n"
+        "ad = OpenAICompatibleAdapter(base_url='http://provider.test/v1', model='m', api_key='k',\n"
+        "    client=client, max_retries=0, policy=pol)\n"
+        "ctx = InvestigationContext(incident_id=inc, service_id='demo-api', epoch=1, step=0,\n"
+        "    tool_calls_used=0, max_tool_calls=12, seconds_remaining=120.0, observations=[],\n"
+        "    adapter_identity='m')\n"
+        "async def main():\n"
+        "    await ad.next_step(ctx)\n"
+        "asyncio.run(main())\n"
+    )
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", code, str(path), str(log), incident],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(2)
+    ]
+    for proc in procs:
+        _, err = proc.communicate(timeout=90)
+        assert proc.returncode == 0, err
+    events = [line.split() for line in log.read_text(encoding="utf-8").splitlines()]
+    assert len(events) == 4, events
+    # Serialized: strictly enter, exit, enter, exit with no overlapping window.
+    assert events[0][0] == "enter" and events[1][0] == "exit"
+    assert events[2][0] == "enter" and events[3][0] == "exit"
+    first_exit = float(events[1][1])
+    second_enter = float(events[2][1])
+    assert second_enter >= first_exit, "cross-process transport calls overlapped"
+
+
+# --- round2: fail-closed validation of an existing ledger ----------------------
+
+
+def _valid_state(**overrides) -> dict:
+    state = policy._empty_state()
+    state["smoke_calls"] = 1
+    state["smoke_pending"] = False
+    state["admitted"] = ["a"]
+    state["active_investigation"] = "a"
+    state["turns"] = {"a": 2}
+    state["attempts"] = {"a": 3}
+    state["input_chars"] = {"a": 1000}
+    state["usage"] = {
+        "a": {"input_tokens": 5, "output_tokens": 7, "total_tokens": 12, "cost": 0.0004}
+    }
+    state.update(overrides)
+    return state
+
+
+def _write_raw(path: Path, text: str) -> str:
+    path.write_text(text, encoding="utf-8")
+    return path.read_text(encoding="utf-8")
+
+
+def test_valid_current_ledger_loads_and_retains_usage(tmp_path: Path) -> None:
+    path = tmp_path / "provider_budget.json"
+    path.write_text(json.dumps(_valid_state()), encoding="utf-8")
+    snapshot = policy.JsonBudgetLedger(path).snapshot()
+    assert snapshot["smoke_calls"] == 1
+    assert snapshot["turns"]["a"] == 2
+    assert snapshot["attempts"]["a"] == 3
+    assert snapshot["input_chars"]["a"] == 1000
+    assert snapshot["usage"]["a"]["output_tokens"] == 7
+
+
+def test_supported_v2_ledger_migrates_and_retains_usage(tmp_path: Path) -> None:
+    path = tmp_path / "provider_budget.json"
+    legacy = _valid_state()
+    legacy.pop("smoke_pending")
+    legacy["schema"] = 2
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+    ledger = policy.JsonBudgetLedger(path)
+    snapshot = ledger.snapshot()
+    assert snapshot["turns"]["a"] == 2
+    assert snapshot["usage"]["a"]["total_tokens"] == 12
+    # A mutation upgrades the record without resetting any counter.
+    assert ledger.begin_turn("a").allowed is True
+    upgraded = json.loads(path.read_text(encoding="utf-8"))
+    assert upgraded["schema"] == policy.LEDGER_SCHEMA
+    assert upgraded["turns"]["a"] == 3
+    assert upgraded["usage"]["a"]["total_tokens"] == 12
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "null",
+        "{}",
+        "[]",
+        '{"schema": 3, "scope": "runtime:incident-investigation"',
+        json.dumps(_valid_state(smoke_calls=-100)),
+        json.dumps(_valid_state(smoke_calls=True)),
+        json.dumps(_valid_state(smoke_calls=10**9)),
+        json.dumps(_valid_state(scope="some-other-scope")),
+        json.dumps(_valid_state(admitted=["a", "a"])),
+        json.dumps({**_valid_state(), "unexpected": 1}),
+        json.dumps(_valid_state(schema=99)),
+        json.dumps(_valid_state(turns={"a": -1})),
+        json.dumps(_valid_state(billing_refused="yes")),
+    ],
+)
+def test_corrupt_existing_ledger_fails_closed_without_overwrite(
+    tmp_path: Path, payload: str
+) -> None:
+    path = tmp_path / "provider_budget.json"
+    original = _write_raw(path, payload)
+    with pytest.raises(policy.ProviderPolicyError):
+        policy.JsonBudgetLedger(path)
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_missing_ledger_initializes_a_new_batch_and_can_admit(tmp_path: Path) -> None:
+    path = tmp_path / "provider_budget.json"
+    ledger = policy.JsonBudgetLedger(path)
+    assert ledger.snapshot()["smoke_calls"] == 0
+    assert ledger.admit_smoke().allowed is True
+    assert path.is_file()
 

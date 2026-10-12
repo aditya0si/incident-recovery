@@ -366,6 +366,70 @@ async def test_executor_dependency_recheck_allows_rollback_when_dependencies_hea
     assert (await store.get_snapshot()).revision == HEALTHY
 
 
+async def test_executor_rechecks_dependencies_after_admission_before_switch(
+    repo: IncidentRepository, store: DeploymentStore
+) -> None:
+    """A dependency that fails while the approval is consumed still refuses.
+
+    Reproduces the parent's consumption-flip shape: the pre-admission check is
+    healthy, but the dependency turns unhealthy during the awaited approval
+    consumption, so the switch must never be invoked.
+    """
+
+    incident, proposal = await _awaiting_incident_with_proposal(repo, store)
+    _, operation, _ = await repo.approve_incident(
+        incident.id, proposal.digest, "alice", now=utcnow()
+    )
+
+    calls = {"n": 0}
+
+    async def flips_unhealthy_after_first_check() -> bool:
+        calls["n"] += 1
+        return calls["n"] == 1
+
+    client = _store_client(store)
+    executor = RecoveryExecutor(
+        repo,
+        client,
+        store,
+        clock=lambda: BASE,
+        dependency_check=flips_unhealthy_after_first_check,
+    )
+    result = await executor.execute(operation.id)
+    assert result.status == OPERATION_FAILED
+    assert result.last_error == "dependencies_unhealthy"
+    assert calls["n"] == 2, "the dependency must be re-observed after admission"
+    assert client.calls == [], "no switch may run once the dependency has flipped"
+    assert (await store.get_snapshot()).revision == BROKEN
+    # The admission step consumed the approval before the flip was observed.
+    approval = await repo.get_approval_for_incident(incident.id)
+    assert approval is not None and approval.consumed_by_operation == operation.id
+
+
+async def test_executor_fails_closed_when_a_dependency_attestation_errors(
+    repo: IncidentRepository, store: DeploymentStore
+) -> None:
+    """A raising/missing attestation is never treated as healthy."""
+
+    incident, proposal = await _awaiting_incident_with_proposal(repo, store)
+    _, operation, _ = await repo.approve_incident(
+        incident.id, proposal.digest, "alice", now=utcnow()
+    )
+
+    async def raises() -> bool:
+        raise RuntimeError("probe unavailable")
+
+    client = _store_client(store)
+    executor = RecoveryExecutor(
+        repo, client, store, clock=lambda: BASE, dependency_check=raises
+    )
+    result = await executor.execute(operation.id)
+    assert result.status == OPERATION_FAILED
+    assert result.last_error == "dependencies_unhealthy"
+    assert client.calls == []
+    assert (await store.get_snapshot()).revision == BROKEN
+
+
 async def test_consumed_approval_cannot_authorize_second_operation(
     repo: IncidentRepository, store: DeploymentStore
 ) -> None:

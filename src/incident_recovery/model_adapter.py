@@ -248,15 +248,11 @@ class OpenAICompatibleAdapter:
         if self._policy is not None and session is not None:
             headers["User-Agent"] = self._policy.user_agent
             headers["x-opencode-session"] = session
-        if self._policy is None:
-            return await client.post(
-                "/chat/completions", json=body, headers=headers, timeout=self._timeout
-            )
-        # Concurrency 1: at most one provider call in flight.
-        async with self._policy.call_lock():
-            return await client.post(
-                "/chat/completions", json=body, headers=headers, timeout=self._timeout
-            )
+        # The caller holds the transport slot (in-process + cross-process
+        # concurrency 1) for the whole attempt, so no lock is taken here.
+        return await client.post(
+            "/chat/completions", json=body, headers=headers, timeout=self._timeout
+        )
 
     def _is_billing_refusal(self, response: httpx.Response) -> bool:
         if response.status_code == 402:
@@ -342,17 +338,40 @@ class OpenAICompatibleAdapter:
                 "response_format": {"type": "json_object"},
             }
             last_status: Optional[int] = None
-            for attempt in range(self._max_retries + 1):
-                if policy is not None:
-                    attempt_gate = policy.begin_attempt(incident_id)
-                    if not attempt_gate.allowed:
-                        raise ProviderBudgetExceeded(
-                            self._safe(f"provider_budget_{attempt_gate.reason}")
-                        )
+            # A staging smoke call is single-use and is never retried
+            # automatically; the default (no-policy) path is unchanged.
+            max_retries = (
+                0 if (policy is not None and context is None) else self._max_retries
+            )
+            for attempt in range(max_retries + 1):
                 try:
-                    response = await self._post(client, body, session)
+                    if policy is not None:
+                        # Hold the transport slot for the whole attempt and
+                        # re-check the authoritative billing latch, admission,
+                        # and attempt budget *inside* it, so a refusal latched by
+                        # another instance/process between attempts can never let
+                        # this retry reach the transport.
+                        async with policy.transport_slot():
+                            if policy.billing_refused():
+                                raise ProviderBillingRefusal(
+                                    self._safe("provider_billing_refusal_latched")
+                                )
+                            if context is not None:
+                                recheck = policy.check_investigation_admission(incident_id)
+                                if not recheck.allowed:
+                                    raise ProviderBudgetExceeded(
+                                        self._safe(f"provider_budget_{recheck.reason}")
+                                    )
+                            attempt_gate = policy.begin_attempt(incident_id)
+                            if not attempt_gate.allowed:
+                                raise ProviderBudgetExceeded(
+                                    self._safe(f"provider_budget_{attempt_gate.reason}")
+                                )
+                            response = await self._post(client, body, session)
+                    else:
+                        response = await self._post(client, body, session)
                 except httpx.HTTPError as exc:
-                    if attempt < self._max_retries:
+                    if attempt < max_retries:
                         await self._sleep(0.5 * (attempt + 1))
                         continue
                     raise ModelUnavailable(
@@ -375,7 +394,7 @@ class OpenAICompatibleAdapter:
                     raise ProviderBillingRefusal(
                         self._safe(f"provider_billing_refusal_{response.status_code}")
                     )
-                if response.status_code in (429, 500, 502, 503, 504) and attempt < self._max_retries:
+                if response.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
                     await self._sleep(0.5 * (attempt + 1))
                     continue
                 raise ModelUnavailable(

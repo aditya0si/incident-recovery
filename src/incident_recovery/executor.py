@@ -48,6 +48,7 @@ from .models import (
     utcnow,
 )
 from .repository import IncidentRepository
+from .service_profile import ServiceProfile, load_service_profile
 
 
 class RecoverySwitchClient(Protocol):
@@ -116,18 +117,36 @@ class RecoveryExecutor:
         if approval.target_revision != operation.target_revision:
             return await self._fail(operation_id, "target_mismatch")
 
+        async def _dependencies_healthy() -> bool:
+            # Fail closed on any missing/stale/negative attestation: an
+            # observation error is *not* treated as healthy.
+            if self._dependency_check is None:
+                return True
+            try:
+                return bool(await self._dependency_check())
+            except Exception:  # noqa: BLE001 - a failed attestation fails closed
+                return False
+
         # Execution-time dependency recheck: a rollback cannot repair a failed
         # dependency, so a deployment that became dependency-unhealthy *after*
-        # approval must never be rolled back.  The check runs before the approval
-        # is consumed, so a refused execution leaves the approval intact.
-        if self._dependency_check is not None:
-            dependencies_healthy = await self._dependency_check()
-            if not dependencies_healthy:
-                return await self._fail(operation_id, "dependencies_unhealthy")
+        # approval must never be rolled back.  This first check runs before the
+        # approval is consumed, so refusing here leaves the approval intact.
+        if not await _dependencies_healthy():
+            return await self._fail(operation_id, "dependencies_unhealthy")
 
         consumed = await self._repo.consume_approval(approval.id, operation_id)
         if not consumed:
             return await self._fail(operation_id, "approval_consumed")
+
+        # Repeat the bounded fresh attestation *after* admission and immediately
+        # before the mutation: a dependency that failed while the approval was
+        # being consumed (an awaited, network/DB round-trip) must still refuse the
+        # switch.  External dependency health cannot be observed atomically with
+        # the switch, so this is a conservative pre-action check, not a claim of
+        # simultaneous atomicity; a change after this observation can still only
+        # be caught by post-action verification.
+        if not await _dependencies_healthy():
+            return await self._fail(operation_id, "dependencies_unhealthy")
 
         await self._repo.set_operation_status(
             operation_id, OPERATION_EXECUTING, bump_attempts=True
@@ -219,9 +238,12 @@ def create_executor_app(
     store: DeploymentStore,
     *,
     internal_token: str,
+    dependency_check: Optional[Callable[[], Awaitable[bool]]] = None,
 ) -> FastAPI:
     app = FastAPI(title="incident-recovery-executor", docs_url=None, redoc_url=None)
-    executor = RecoveryExecutor(repo, switch_client, store)
+    executor = RecoveryExecutor(
+        repo, switch_client, store, dependency_check=dependency_check
+    )
 
     def authorize(token: Optional[str]) -> None:
         supplied = token or ""
@@ -267,6 +289,30 @@ async def _build_pool(dsn: str, attempts: int = 30, delay: float = 1.0):
     raise RuntimeError(f"PostgreSQL unavailable after {attempts} attempts: {last!r}")
 
 
+def build_dependency_check(
+    profile: ServiceProfile, env: dict
+) -> Optional[Callable[[], Awaitable[bool]]]:
+    """A bounded, authoritative mutation-boundary dependency attestation.
+
+    Only the isolated staging workload has independent dependencies (its own
+    PostgreSQL and Redis) that a rollback cannot repair, so only staging gets a
+    fresh execution-time check.  The demo (and any other profile) keeps its
+    unchanged, check-free behaviour.  A probe error fails closed.
+    """
+
+    if profile.name != "staging":
+        return None
+    from .staging.observations import StagingDependencyProbe
+
+    probe = StagingDependencyProbe.from_env(env)
+
+    async def check() -> bool:
+        status = await probe.check()
+        return bool(status.ok)
+
+    return check
+
+
 async def _serve() -> None:
     import uvicorn
 
@@ -280,12 +326,20 @@ async def _serve() -> None:
         raise SystemExit("INTERNAL_TOKEN is required")
     pool = await _build_pool(dsn)
     repo = IncidentRepository(pool)
-    store = DeploymentStore(pool)
+    profile = load_service_profile(os.environ)
+    store = DeploymentStore(pool, profile=profile)
     switch_client = HttpSwitchClient(
         os.environ.get("GATEWAY_INTERNAL_URL", "http://gateway-control:8000"),
         internal_token,
     )
-    app = create_executor_app(repo, switch_client, store, internal_token=internal_token)
+    dependency_check = build_dependency_check(profile, os.environ)
+    app = create_executor_app(
+        repo,
+        switch_client,
+        store,
+        internal_token=internal_token,
+        dependency_check=dependency_check,
+    )
     port = int(os.environ.get("PORT", "8000"))
     server = uvicorn.Server(
         uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")

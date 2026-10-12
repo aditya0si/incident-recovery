@@ -45,7 +45,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Optional, Protocol
+from typing import Any, AsyncIterator, Iterator, Mapping, Optional, Protocol
 from uuid import UUID, uuid5
 
 from .models import InvestigationBudgetExhausted, ModelUnavailable, utcnow
@@ -245,6 +245,10 @@ class ProviderBillingRefusal(ModelUnavailable):
 class ProviderLimits:
     max_investigations: int = 12
     max_smoke_calls: int = 1
+    # A smoke admission is a single-use permission: at most one turn and one
+    # transport attempt, and it is never retried automatically.
+    max_smoke_turns: int = 1
+    max_smoke_attempts: int = 1
     max_turns_per_incident: int = 8
     max_attempts_per_incident: int = 8
     max_output_tokens: int = 4096
@@ -299,7 +303,15 @@ class BudgetDecision:
 
 # --- durable ledger -----------------------------------------------------------
 
-LEDGER_SCHEMA = 2
+LEDGER_SCHEMA = 3
+# Schema 1/2 are explicitly migratable: their counters/usage are retained and
+# new fields default conservatively (never granting a fresh permission).  Any
+# other schema is refused rather than silently reset.
+_SUPPORTED_SCHEMAS = (1, 2, LEDGER_SCHEMA)
+# Any persisted counter above this bound is treated as corrupt/tampered, never
+# as a legitimate allowance.
+_MAX_COUNTER = 1_000_000
+_USAGE_KEYS = ("input_tokens", "output_tokens", "total_tokens", "cost")
 
 
 if os.name == "nt":  # pragma: no cover - exercised on Windows CI/host
@@ -351,11 +363,48 @@ def _interprocess_lock(lock_path: Path) -> Iterator[None]:
         os.close(fd)
 
 
+class _AsyncFileLock:
+    """An async cross-process exclusive file lock.
+
+    The blocking OS lock is acquired/released on a worker thread so the event
+    loop keeps running while this process waits for its turn.  The lock is
+    process/fd-scoped and is released by the OS if the holder crashes; the file
+    lives apart from the ledger lock so the two can never deadlock each other.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._fd: Optional[int] = None
+
+    async def __aenter__(self) -> "_AsyncFileLock":
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(self._path), os.O_RDWR | os.O_CREAT)
+        if os.fstat(fd).st_size == 0:
+            os.write(fd, b"\0")
+        try:
+            await asyncio.to_thread(_lock_fd, fd)
+        except BaseException:
+            os.close(fd)
+            raise
+        self._fd = fd
+        return self
+
+    async def __aexit__(self, *_exc: Any) -> None:
+        fd, self._fd = self._fd, None
+        if fd is None:
+            return
+        try:
+            await asyncio.to_thread(_unlock_fd, fd)
+        finally:
+            os.close(fd)
+
+
 def _empty_state() -> dict:
     return {
         "schema": LEDGER_SCHEMA,
         "scope": GO_RUNTIME_SCOPE,
         "smoke_calls": 0,
+        "smoke_pending": False,
         "admitted": [],
         "active_investigation": None,
         "turns": {},
@@ -368,28 +417,118 @@ def _empty_state() -> dict:
     }
 
 
-def _normalize_state(data: Any) -> dict:
-    state = _empty_state()
+def _as_counter(value: Any, name: str, *, maximum: int = _MAX_COUNTER) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ProviderPolicyError(f"provider_budget_ledger_invalid_{name}")
+    if value < 0 or value > maximum:
+        raise ProviderPolicyError(f"provider_budget_ledger_invalid_{name}")
+    return value
+
+
+def _validate_counter_map(raw: Any, name: str) -> dict:
+    if not isinstance(raw, Mapping):
+        raise ProviderPolicyError(f"provider_budget_ledger_invalid_{name}")
+    result: dict = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not key or key in result:
+            raise ProviderPolicyError(f"provider_budget_ledger_invalid_{name}")
+        result[key] = _as_counter(value, name)
+    return result
+
+
+def _validate_usage(raw: Any) -> dict:
+    if not isinstance(raw, Mapping):
+        raise ProviderPolicyError("provider_budget_ledger_invalid_usage")
+    result: dict = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not key or not isinstance(value, Mapping):
+            raise ProviderPolicyError("provider_budget_ledger_invalid_usage")
+        if set(value) - set(_USAGE_KEYS):
+            raise ProviderPolicyError("provider_budget_ledger_invalid_usage")
+        entry: dict = {}
+        for field_name in _USAGE_KEYS:
+            item = value.get(field_name)
+            if item is None:
+                entry[field_name] = None
+            elif field_name == "cost":
+                if isinstance(item, bool) or not isinstance(item, (int, float)) or item < 0:
+                    raise ProviderPolicyError("provider_budget_ledger_invalid_usage")
+                entry[field_name] = float(item)
+            else:
+                entry[field_name] = _as_counter(item, f"usage_{field_name}")
+        result[key] = entry
+    return result
+
+
+def _validate_state(data: Any, *, limits: ProviderLimits) -> dict:
+    """Strictly validate an *existing* ledger record, migrating v1/v2.
+
+    A missing file is a deliberate new batch (handled by the caller); anything
+    present that is null, empty, mistyped, negative, oversized, of an unknown
+    schema/scope, or has duplicate/unknown fields is refused.  The original file
+    is never overwritten by a rejected read.
+    """
+
     if not isinstance(data, Mapping):
-        return state
-    state["smoke_calls"] = int(data.get("smoke_calls", 0) or 0)
-    admitted = data.get("admitted", [])
-    state["admitted"] = [str(item) for item in admitted] if isinstance(admitted, list) else []
-    active = data.get("active_investigation")
-    state["active_investigation"] = str(active) if active is not None else None
-    for key in ("turns", "attempts", "input_chars"):
-        raw = data.get(key, {})
-        if isinstance(raw, Mapping):
-            state[key] = {str(k): int(v) for k, v in raw.items()}
-    raw_usage = data.get("usage", {})
-    if isinstance(raw_usage, Mapping):
-        state["usage"] = {
-            str(k): dict(v) for k, v in raw_usage.items() if isinstance(v, Mapping)
-        }
-    state["billing_refused"] = bool(data.get("billing_refused", False))
-    reason = data.get("billing_reason")
-    state["billing_reason"] = redact_secrets(str(reason)) if reason is not None else None
-    state["updated_at"] = data.get("updated_at")
+        raise ProviderPolicyError("provider_budget_ledger_not_an_object")
+    schema = data.get("schema")
+    if isinstance(schema, bool) or not isinstance(schema, int) or schema not in _SUPPORTED_SCHEMAS:
+        raise ProviderPolicyError("provider_budget_ledger_schema_unsupported")
+
+    allowed = set(_empty_state().keys())
+    if set(data) - allowed:
+        raise ProviderPolicyError("provider_budget_ledger_unknown_field")
+    required = set(allowed)
+    if schema < LEDGER_SCHEMA:
+        # Older schema: no smoke_pending yet; it defaults to False (never grants).
+        required.discard("smoke_pending")
+    if required - set(data):
+        raise ProviderPolicyError("provider_budget_ledger_missing_field")
+
+    if data.get("scope") != GO_RUNTIME_SCOPE:
+        raise ProviderPolicyError("provider_budget_ledger_scope_mismatch")
+
+    state = _empty_state()
+    state["schema"] = LEDGER_SCHEMA
+    state["smoke_calls"] = _as_counter(data["smoke_calls"], "smoke_calls")
+    if "smoke_pending" in data:
+        if not isinstance(data["smoke_pending"], bool):
+            raise ProviderPolicyError("provider_budget_ledger_invalid_smoke_pending")
+        state["smoke_pending"] = data["smoke_pending"]
+    if state["smoke_pending"] and state["smoke_calls"] < 1:
+        raise ProviderPolicyError("provider_budget_ledger_invalid_smoke_pending")
+
+    admitted = data["admitted"]
+    if not isinstance(admitted, list):
+        raise ProviderPolicyError("provider_budget_ledger_invalid_admitted")
+    seen: set[str] = set()
+    for item in admitted:
+        if not isinstance(item, str) or not item or item in seen:
+            raise ProviderPolicyError("provider_budget_ledger_invalid_admitted")
+        seen.add(item)
+    state["admitted"] = list(admitted)
+
+    active = data["active_investigation"]
+    if active is not None and (not isinstance(active, str) or active not in seen):
+        raise ProviderPolicyError("provider_budget_ledger_invalid_active_investigation")
+    state["active_investigation"] = active
+
+    state["turns"] = _validate_counter_map(data["turns"], "turns")
+    state["attempts"] = _validate_counter_map(data["attempts"], "attempts")
+    state["input_chars"] = _validate_counter_map(data["input_chars"], "input_chars")
+    state["usage"] = _validate_usage(data["usage"])
+
+    if not isinstance(data["billing_refused"], bool):
+        raise ProviderPolicyError("provider_budget_ledger_invalid_billing_refused")
+    state["billing_refused"] = data["billing_refused"]
+    reason = data["billing_reason"]
+    if reason is not None and not isinstance(reason, str):
+        raise ProviderPolicyError("provider_budget_ledger_invalid_billing_reason")
+    state["billing_reason"] = redact_secrets(reason) if reason is not None else None
+    updated = data["updated_at"]
+    if updated is not None and not isinstance(updated, str):
+        raise ProviderPolicyError("provider_budget_ledger_invalid_updated_at")
+    state["updated_at"] = updated
     return state
 
 
@@ -428,9 +567,14 @@ class BudgetLedger(Protocol):
 
     def admit_smoke(self) -> BudgetDecision: ...
 
+    def consume_smoke(self) -> BudgetDecision: ...
+
     def is_admitted(self, incident_id: Any) -> bool: ...
 
     def smoke_admitted(self) -> bool: ...
+
+    @property
+    def transport_lock_path(self) -> Optional[Path]: ...
 
     def mark_billing_refused(self, reason: Optional[str] = None) -> None: ...
 
@@ -493,6 +637,18 @@ class JsonBudgetLedger:
     def lock_path(self) -> Path:
         return self._lock_path
 
+    @property
+    def transport_lock_path(self) -> Path:
+        """A *separate* cross-process lock serializing provider transport calls.
+
+        It is a distinct file from the ledger mutation lock so holding it across
+        the network request can never deadlock the ledger transaction (which only
+        ever takes ``lock_path``).  It is released automatically by the OS if the
+        holding process crashes.
+        """
+
+        return self._path.with_name(self._path.name + ".transport.lock")
+
     # -- transaction primitives --
 
     @contextlib.contextmanager
@@ -510,12 +666,16 @@ class JsonBudgetLedger:
                 self._write(state)
 
     def _read(self) -> dict:
+        # A missing file is a deliberate new batch.  An existing file is strictly
+        # validated (and, for a supported older schema, explicitly migrated) so a
+        # null/empty/corrupt ledger can never silently reset the allowance.
         if not self._path.is_file():
             return _empty_state()
         try:
-            return _normalize_state(json.loads(self._path.read_text(encoding="utf-8")))
+            data = json.loads(self._path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             raise ProviderPolicyError("provider_budget_ledger_unreadable") from exc
+        return _validate_state(data, limits=self._limits)
 
     def _write(self, state: dict) -> None:
         state["updated_at"] = self._clock().isoformat()
@@ -562,9 +722,28 @@ class JsonBudgetLedger:
                 return BudgetDecision(False, "concurrency_limit")
             if state["smoke_calls"] >= self._limits.max_smoke_calls:
                 return BudgetDecision(False, "smoke_limit", 0)
+            # Record a single-use permission; it is not consumable until an
+            # atomic ``consume_smoke`` (before transport) claims it once.
             state["smoke_calls"] += 1
+            state["smoke_pending"] = True
             remaining = self._limits.max_smoke_calls - state["smoke_calls"]
             return BudgetDecision(True, "smoke_admitted", remaining)
+
+    def consume_smoke(self) -> BudgetDecision:
+        """Atomically claim the one-shot smoke permission before transport.
+
+        A second consumption -- in this instance, another instance, or a
+        restarted process over the same ledger -- is refused, so one admission
+        can never authorize more than one transport.
+        """
+
+        with self._locked_write() as state:
+            if int(state["smoke_calls"]) < 1:
+                return BudgetDecision(False, "smoke_not_admitted")
+            if not state["smoke_pending"]:
+                return BudgetDecision(False, "smoke_already_consumed")
+            state["smoke_pending"] = False
+            return BudgetDecision(True, "smoke_consumed", 0)
 
     def is_admitted(self, incident_id: Any) -> bool:
         key = str(incident_id)
@@ -593,23 +772,31 @@ class JsonBudgetLedger:
 
     def begin_turn(self, incident_id: Any) -> BudgetDecision:
         key = _ledger_key(incident_id)
+        limit = (
+            self._limits.max_smoke_turns
+            if key == SMOKE_KEY
+            else self._limits.max_turns_per_incident
+        )
         with self._locked_write() as state:
             used = int(state["turns"].get(key, 0))
-            if used >= self._limits.max_turns_per_incident:
+            if used >= limit:
                 return BudgetDecision(False, "turn_limit", 0)
             state["turns"][key] = used + 1
-            return BudgetDecision(True, "turn", self._limits.max_turns_per_incident - used - 1)
+            return BudgetDecision(True, "turn", limit - used - 1)
 
     def begin_attempt(self, incident_id: Any) -> BudgetDecision:
         key = _ledger_key(incident_id)
+        limit = (
+            self._limits.max_smoke_attempts
+            if key == SMOKE_KEY
+            else self._limits.max_attempts_per_incident
+        )
         with self._locked_write() as state:
             used = int(state["attempts"].get(key, 0))
-            if used >= self._limits.max_attempts_per_incident:
+            if used >= limit:
                 return BudgetDecision(False, "attempt_limit", 0)
             state["attempts"][key] = used + 1
-            return BudgetDecision(
-                True, "attempt", self._limits.max_attempts_per_incident - used - 1
-            )
+            return BudgetDecision(True, "attempt", limit - used - 1)
 
     # -- usage --
 
@@ -727,6 +914,24 @@ class StagingProviderPolicy:
             self._call_lock = asyncio.Lock()
         return self._call_lock
 
+    @contextlib.asynccontextmanager
+    async def transport_slot(self) -> AsyncIterator[None]:
+        """Serialize provider transport calls with concurrency 1 *cross-process*.
+
+        The in-process asyncio lock is taken first, then a separate cross-process
+        file lock is held for the whole request.  Holding it never touches the
+        ledger mutation lock (a different file), so the two cannot deadlock, and
+        the OS releases it if the holder crashes.
+        """
+
+        async with self.call_lock():
+            lock_path = getattr(self._ledger, "transport_lock_path", None)
+            if lock_path is None:
+                yield
+            else:
+                async with _AsyncFileLock(lock_path):
+                    yield
+
     def admit_investigation(self, incident_id: Any) -> BudgetDecision:
         self.require_runtime_eligible()
         return self._ledger.admit_investigation(str(incident_id))
@@ -747,12 +952,14 @@ class StagingProviderPolicy:
         return BudgetDecision(False, "investigation_not_admitted")
 
     def check_smoke_admission(self) -> BudgetDecision:
-        """Refuse the smoke transport unless a smoke call was authoritatively admitted."""
+        """Atomically consume the one-shot smoke permission before transport.
+
+        One admitted smoke call can authorize at most one transport; a second
+        check -- in another instance or a restarted process -- is refused.
+        """
 
         self.require_runtime_eligible()
-        if self._ledger.smoke_admitted():
-            return BudgetDecision(True, "smoke_admitted")
-        return BudgetDecision(False, "smoke_not_admitted")
+        return self._ledger.consume_smoke()
 
     def mark_billing_refused(self, reason: Optional[str] = None) -> None:
         self._ledger.mark_billing_refused(reason)

@@ -121,11 +121,17 @@ unresolved, recorded as blocked rather than claimed eligible or prohibited.
   and a stable incident-derived `x-opencode-session` (same session across turns
   and retries, different across incidents). It never spoofs another client.
 - Paid calls are bounded by a staging-specific durable ledger: at most 12
-  investigations plus one smoke call, concurrency 1, 8 provider turns per
-  incident, 4096 output tokens per call, 20000 input characters per call and
-  12 tools / 120 seconds; attempts (including retries) are counted separately
-  and cannot exceed the paid allowance. Unknown provider usage/cost is recorded
-  as unknown, never zero.
+  investigations plus **one single-use smoke call** (one turn, one attempt,
+  never retried), concurrency 1, 8 provider turns per incident, 4096 output
+  tokens per call, 20000 input characters per call and 12 tools / 120 seconds;
+  attempts (including retries) are counted separately and cannot exceed the paid
+  allowance.  Every attempt re-checks the durable billing latch, admission, and
+  budget inside a cross-process transport slot, so a refusal latched by another
+  instance/process between attempts is enforced before transport.  Unknown
+  provider usage/cost is recorded as unknown, never zero.  An existing ledger
+  that is null/empty/corrupt/negative/oversized is refused (not silently reset);
+  only a missing file starts a new batch, and v1/v2 records migrate retaining
+  usage.
 - **No live provider call was made in Task 2.** The live gate is reported
   explicitly blocked; this is not a live provider compatibility claim. Coding
   through OpenCode remains allowed separately.
@@ -163,7 +169,7 @@ Reported status (actual, from the executed run):
 
 | Gate | Status | Evidence |
 | --- | --- | --- |
-| `staging_integration` | passed | source/fault materialization; Docker-free staging suite 163 passed (+1 opt-in skip run separately via `STAGING_E2E=1`); real baseline 25/25; real recovery 20/20; scripted evaluation 12/12 |
+| `staging_integration` | passed | source/fault materialization; Docker-free staging suite 221 passed (+1 opt-in skip run separately via `STAGING_E2E=1`); real baseline 25/25; real recovery 20/20; scripted evaluation 12/12 |
 | `demo_regression` | passed | `scripts/verify.py --docker --ui`: 19 checks passed / 0 failed / 0 blocked; 229 executed test cases |
 | `live_readiness` | **blocked** | 12 blocked cases, 0 executed, 0 provider requests, `safety_ok: null` (not established) |
 | `provider_blocked` | **blocked** | `go_runtime_eligible(default_go_runtime_eligibility())` is `False` |

@@ -49,6 +49,7 @@ from incident_recovery.repository import IncidentRepository  # noqa: E402
 from incident_recovery.service_profile import STAGING_PROFILE  # noqa: E402
 from incident_recovery.staging.contracts import StagingSwitchRequest  # noqa: E402
 from incident_recovery.staging.observations import (  # noqa: E402
+    ObservationError,
     StagingDependencyProbe,
     StagingFunctionalProbe,
     StagingObserver,
@@ -253,7 +254,18 @@ async def _drive(
         known_good_revision=HEALTHY,
         broken_revision=FAULTY,
     )
-    executor = RecoveryExecutor(repo, StoreSwitchClient(store), store)
+    async def _dependencies_healthy() -> bool:
+        """A bounded fresh dependency attestation immediately before mutation."""
+
+        try:
+            health = await observer.observe_health()
+        except ObservationError:
+            return False
+        return bool(health.dependencies_ok)
+
+    executor = RecoveryExecutor(
+        repo, StoreSwitchClient(store), store, dependency_check=_dependencies_healthy
+    )
     verifier = RecoveryVerifier(probe, interval=2.0, required_streak=3, deadline_seconds=30.0)
     worker = RecoveryWorker(
         repo,

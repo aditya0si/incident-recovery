@@ -285,9 +285,16 @@ services:
     command: ["python", "-m", "incident_recovery.executor"]
     environment:
       PORT: "8000"
+      SERVICE_PROFILE: staging
       DATABASE_URL: postgres://${STAGING_CONTROL_DB_USER}:${STAGING_CONTROL_DB_PASSWORD}@control-postgres:5432/${STAGING_CONTROL_DB}
       INTERNAL_TOKEN: ${STAGING_INTERNAL_TOKEN}
       GATEWAY_INTERNAL_URL: http://staging-gateway-control:8081
+      # The executor independently attests the workload dependencies immediately
+      # before any mutation, so a rollback cannot run during a dependency outage.
+      STAGING_PG_HOST: postgres
+      STAGING_PG_PORT: "5432"
+      STAGING_REDIS_HOST: redis
+      STAGING_REDIS_PORT: "6379"
     networks:
       - staging_net
     depends_on:
