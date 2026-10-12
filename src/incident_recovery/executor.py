@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import os
-from typing import Optional, Protocol
+from typing import Awaitable, Callable, Optional, Protocol
 from uuid import UUID
 
 import httpx
@@ -69,11 +69,13 @@ class RecoveryExecutor:
         store: DeploymentStore,
         *,
         clock=utcnow,
+        dependency_check: Optional[Callable[[], Awaitable[bool]]] = None,
     ) -> None:
         self._repo = repo
         self._switch = switch_client
         self._store = store
         self._clock = clock
+        self._dependency_check = dependency_check
 
     async def execute(self, operation_id: UUID) -> Operation:
         operation = await self._repo.get_operation(operation_id)
@@ -113,6 +115,15 @@ class RecoveryExecutor:
             return await self._fail(operation_id, "service_mismatch")
         if approval.target_revision != operation.target_revision:
             return await self._fail(operation_id, "target_mismatch")
+
+        # Execution-time dependency recheck: a rollback cannot repair a failed
+        # dependency, so a deployment that became dependency-unhealthy *after*
+        # approval must never be rolled back.  The check runs before the approval
+        # is consumed, so a refused execution leaves the approval intact.
+        if self._dependency_check is not None:
+            dependencies_healthy = await self._dependency_check()
+            if not dependencies_healthy:
+                return await self._fail(operation_id, "dependencies_unhealthy")
 
         consumed = await self._repo.consume_approval(approval.id, operation_id)
         if not consumed:

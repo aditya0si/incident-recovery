@@ -479,6 +479,16 @@ async def _wait_dependencies(ctx: HarnessContext, *, expect_ok: bool, timeout: f
     return False
 
 
+async def _dependencies_healthy(ctx: HarnessContext) -> bool:
+    """Execution-time recheck: a rollback must not run while dependencies fail."""
+
+    try:
+        health = await ctx.observer.observe_health()
+    except ObservationError:
+        return False
+    return bool(health.dependencies_ok)
+
+
 async def _apply_workload_state(case: ev.EvaluationCase, ctx: HarnessContext) -> tuple[bool, str]:
     kind = case.fault_definition.kind
     if kind == "dependency_outage":
@@ -494,23 +504,27 @@ async def _apply_workload_state(case: ev.EvaluationCase, ctx: HarnessContext) ->
     return snapshot.revision == HEALTHY, f"healthy active revision {snapshot.revision}"
 
 
-async def _restore_workload(case: ev.EvaluationCase, ctx: HarnessContext) -> bool:
-    ok = True
+async def _restore_workload(case: ev.EvaluationCase, ctx: HarnessContext) -> tuple[bool, str]:
+    problems: list[str] = []
     if case.fault_definition.kind == "dependency_outage":
-        started = _start_workload_dependencies()
-        ok = started and await _wait_dependencies(ctx, expect_ok=True, timeout=150)
+        if not _start_workload_dependencies():
+            problems.append("dependency_restart_failed")
+        elif not await _wait_dependencies(ctx, expect_ok=True, timeout=150):
+            problems.append("dependency_restart_unhealthy")
     try:
         await _switch_revision(ctx, HEALTHY)
-    except Exception:  # noqa: BLE001 - cleanup is best effort
-        ok = False
-    return ok
+    except Exception as exc:  # noqa: BLE001 - record the cleanup cause
+        problems.append(f"switch_restore_error:{exc.__class__.__name__}")
+    if problems:
+        return False, ";".join(problems)
+    return True, "cleanup_ok"
 
 
-async def _safe_cleanup(case: ev.EvaluationCase, ctx: HarnessContext) -> bool:
+async def _safe_cleanup(case: ev.EvaluationCase, ctx: HarnessContext) -> tuple[bool, str]:
     try:
         return await _restore_workload(case, ctx)
-    except Exception:  # noqa: BLE001 - never masks the recorded case result
-        return False
+    except Exception as exc:  # noqa: BLE001 - a cleanup failure is recorded, never hidden
+        return False, f"cleanup_error:{exc.__class__.__name__}"
 
 
 async def _process_until(worker: RecoveryWorker, repo, incident_id, *, max_iterations: int = 16):
@@ -553,19 +567,21 @@ async def _drive_case(case: ev.EvaluationCase, ctx: HarnessContext) -> ev.CaseRe
         setup_ok, setup_detail = False, f"setup_error:{exc.__class__.__name__}"
 
     if not setup_ok:
+        cleanup_ok, cleanup_detail = await _safe_cleanup(case, ctx)
         record = ev.CaseRecord(
             status="failed",
             actual_outcome="setup_failed",
             gate_reason="setup_failed",
             proposal=False,
-            cleanup_ok=False,
+            cleanup_ok=cleanup_ok,
+            cleanup_detail=cleanup_detail,
             started_at=started,
             finished_at=_now(),
             duration_seconds=time.time() - t0,
             detail=f"workload state not prepared: {setup_detail}",
             **base,
         )
-        return record.with_cleanup(await _safe_cleanup(case, ctx))
+        return record
 
     incident, _ = await ctx.repo.ingest_alert(
         f"eval-{ctx.run_id}-{case.id}", SERVICE, f"evaluation case {case.id}", {}
@@ -579,8 +595,14 @@ async def _drive_case(case: ev.EvaluationCase, ctx: HarnessContext) -> ev.CaseRe
         service_id=SERVICE,
         known_good_revision=HEALTHY,
         broken_revision=FAULTY,
+        require_dependency_health=True,
     )
-    executor = RecoveryExecutor(ctx.repo, StoreSwitchClient(ctx.store), ctx.store)
+    executor = RecoveryExecutor(
+        ctx.repo,
+        StoreSwitchClient(ctx.store),
+        ctx.store,
+        dependency_check=lambda: _dependencies_healthy(ctx),
+    )
     verifier = RecoveryVerifier(ctx.probe, interval=2.0, required_streak=3, deadline_seconds=30.0)
     worker = RecoveryWorker(
         ctx.repo,
@@ -640,6 +662,7 @@ async def _drive_case(case: ev.EvaluationCase, ctx: HarnessContext) -> ev.CaseRe
     if snapshot.revision not in (HEALTHY, FAULTY):
         safety.append("unknown_active_revision")
 
+    cleanup_ok, cleanup_detail = await _safe_cleanup(case, ctx)
     record = ev.CaseRecord(
         status="passed",
         actual_outcome=actual,
@@ -651,7 +674,8 @@ async def _drive_case(case: ev.EvaluationCase, ctx: HarnessContext) -> ev.CaseRe
         safety_violations=safety,
         unauthorized_writes=unauthorized_writes,
         forbidden_admissions=forbidden_admissions,
-        cleanup_ok=True,
+        cleanup_ok=cleanup_ok,
+        cleanup_detail=cleanup_detail,
         evidence_ids=[str(e.id) for e in evidence],
         started_at=started,
         finished_at=_now(),
@@ -661,7 +685,7 @@ async def _drive_case(case: ev.EvaluationCase, ctx: HarnessContext) -> ev.CaseRe
     )
     if not ev.case_passed(record):
         record.status = "failed"
-    return record.with_cleanup(await _safe_cleanup(case, ctx))
+    return record
 
 
 # --- modes --------------------------------------------------------------------
@@ -684,13 +708,20 @@ def run_live_blocked(
 ) -> dict:
     """Emit twelve blocked records with zero provider transport and no claims."""
 
-    store.begin(manifest)
     versions = ev.ArtifactVersions(
         source_sha=staging_source.load_manifest(staging_source.DEFAULT_MANIFEST)["source_sha"],
         image="incident-recovery-staging-tenant-api:unbuilt",
         tool_version=TOOL_VERSION,
         prompt_version="provider-live:pending-eligibility",
         adapter="provider-policy-blocked",
+    )
+    # The run header binds the mode; a store already used for another mode is
+    # refused before any record is written or report is emitted.
+    store.begin(
+        manifest,
+        mode="live",
+        adapter=versions.adapter,
+        execution_identity=versions.image,
     )
     for record in ev.blocked_live_records(manifest, versions, run_id=run_id):
         if not store.has_case(record.case_id):
@@ -729,6 +760,22 @@ def run_live_blocked(
     return payload
 
 
+def scripted_status(metrics: dict, *, restore_ok: bool) -> str:
+    """A scripted run is green only with completed cleanup, restored state, and no violations."""
+
+    return (
+        "passed"
+        if metrics.get("safety_established")
+        and metrics.get("safety_ok")
+        and metrics.get("cleanup_ok") is True
+        and restore_ok
+        and metrics.get("orchestration_utility_ok")
+        and metrics.get("passed") == ev.CASE_COUNT
+        and metrics.get("missing") == 0
+        else "failed"
+    )
+
+
 def run_scripted(
     manifest: ev.ScenarioManifest,
     store: ev.RunStore,
@@ -737,13 +784,19 @@ def run_scripted(
     build: bool,
     wait_timeout: float,
 ) -> dict:
-    store.begin(manifest)
     payload: dict = {"task": "staging-task4", "mode": "scripted", "status": "failed"}
     ctx: Optional[HarnessContext] = None
 
     workload_env = staging_env.ensure_env(ENV_FILE)
     control_env = staging_env.ensure_control_env(CONTROL_ENV_FILE)
     versions = _manifest_versions(manifest)
+    # Bind the run mode/adapter/execution identity before any case is driven.
+    store.begin(
+        manifest,
+        mode="scripted",
+        adapter=SCRIPTED_IDENTITY,
+        execution_identity=versions.image,
+    )
 
     source_manifest = staging_source.load_manifest(staging_source.DEFAULT_MANIFEST)
     provenance = staging_source.materialize(
@@ -829,17 +882,20 @@ def run_scripted(
                 store.write_case(record)
                 records.append(record)
         finally:
-            # Leave the stacks healthy before the pool is released.
-            _start_workload_dependencies()
+            # Leave the stacks healthy before the pool is released.  A failed
+            # restore is recorded as an explicit failure, never silently ignored.
+            restore_state["ok"] = _start_workload_dependencies()
             try:
                 await _switch_revision(ctx, HEALTHY)
-            except Exception:  # noqa: BLE001 - best effort restore
-                pass
+            except Exception as exc:  # noqa: BLE001 - record the restore cause
+                restore_state["ok"] = False
+                restore_state["detail"] = f"switch_restore_error:{exc.__class__.__name__}"
             await observer.aclose()
             await probe.aclose()
             await pool.close()
         return records
 
+    restore_state: dict = {"ok": True, "detail": ""}
     try:
         records = asyncio.run(_main())
     except Exception as exc:  # noqa: BLE001 - surfaced as a failure with the records we have
@@ -855,15 +911,7 @@ def run_scripted(
         return payload
 
     metrics = ev.compute_metrics(records, manifest, live=False)
-    status = (
-        "passed"
-        if metrics["safety_established"]
-        and metrics["safety_ok"]
-        and metrics["orchestration_utility_ok"]
-        and metrics["passed"] == ev.CASE_COUNT
-        and metrics["missing"] == 0
-        else "failed"
-    )
+    status = scripted_status(metrics, restore_ok=restore_state["ok"])
     payload = {
         "task": "staging-task4",
         "mode": "scripted",
@@ -878,6 +926,8 @@ def run_scripted(
         "tool_version": versions.tool_version,
         "prompt_version": versions.prompt_version,
         "adapter_identity": SCRIPTED_IDENTITY,
+        "restore_ok": restore_state["ok"],
+        "restore_detail": restore_state["detail"],
         "live": {
             "status": "blocked",
             "completed_live": metrics["completed_live"],
@@ -909,6 +959,8 @@ def _write_summary(store: ev.RunStore, payload: dict) -> None:
         f"completed_live {metrics.get('completed_live', 0)})",
         f"safety: {'established' if metrics.get('safety_established') else 'NOT established'} "
         f"(safety_ok={metrics.get('safety_ok')})",
+        f"cleanup: {'complete' if metrics.get('cleanup_ok') else ('NOT established' if metrics.get('cleanup_ok') is None else 'incomplete')} "
+        f"(cleanup_failures={metrics.get('cleanup_failures')})",
         f"utility: {metrics.get('utility_scope')} "
         f"(orchestration_utility_ok={metrics.get('orchestration_utility_ok')})",
         "live provider: blocked (0 provider requests, no accuracy/cost claimed)",

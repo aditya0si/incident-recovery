@@ -30,13 +30,13 @@ def _snapshot() -> DeploymentSnapshot:
     )
 
 
-def _evidence(incident_id, *, kind: EvidenceType, payload: dict, epoch: int = 1) -> Evidence:
+def _evidence(incident_id, *, kind: EvidenceType, payload: dict, epoch: int = 1, observed_at=NOW) -> Evidence:
     return Evidence(
         id=uuid4(),
         incident_id=incident_id,
         source="tool:health" if kind is EvidenceType.HEALTH else "tool:deployments",
         evidence_type=kind,
-        observed_at=NOW,
+        observed_at=observed_at,
         payload=payload,
         epoch=epoch,
     )
@@ -187,3 +187,147 @@ def test_dependency_outage_with_stale_generation_never_admits_a_rollback() -> No
     assert decision.allowed is False
     assert decision.reason == "dependencies_unhealthy"
     assert getattr(decision, "target_revision", None) is None
+
+
+# --- dependency veto is independent of the model's citations -------------------
+
+
+def _health(incident_id, *, deps_ok, observed_at=NOW, functional_ok=False):
+    return _evidence(
+        incident_id,
+        kind=EvidenceType.HEALTH,
+        payload={
+            "functional_ok": functional_ok,
+            "http_status": 500,
+            "dependencies_ok": deps_ok,
+        },
+        observed_at=observed_at,
+    )
+
+
+def test_uncited_later_dependency_outage_vetoes_a_cited_healthy_sample() -> None:
+    """The model cites an earlier healthy sample and omits a later outage.
+
+    The gate considers the whole current epoch, so the newer outage still vetoes
+    and no proposal target is ever returned.
+    """
+
+    incident_id = uuid4()
+    earlier = datetime(2026, 10, 12, 12, 0, 0, tzinfo=timezone.utc)
+    later = datetime(2026, 10, 12, 12, 5, 0, tzinfo=timezone.utc)
+    healthy_sample = _health(incident_id, deps_ok=True, observed_at=earlier)
+    outage = _health(incident_id, deps_ok=False, observed_at=later)
+    deployment = _deployment_evidence(incident_id)
+    # The model only cites the earlier healthy sample + the deployment.
+    decision = evaluate_diagnosis(
+        _diagnosis([healthy_sample.id, deployment.id]),
+        incident_id=incident_id,
+        epoch=1,
+        evidence=[healthy_sample, outage, deployment],
+        snapshot=_snapshot(),
+        known_good_revision=HEALTHY,
+        broken_revision=FAULTY,
+    )
+    assert decision.allowed is False
+    assert decision.reason in ("dependencies_unhealthy", "dependencies_contradictory")
+    assert getattr(decision, "target_revision", None) is None
+
+
+def test_contradictory_dependency_evidence_fails_closed() -> None:
+    incident_id = uuid4()
+    healthy = _health(incident_id, deps_ok=True)
+    outage = _health(incident_id, deps_ok=False)
+    deployment = _deployment_evidence(incident_id)
+    decision = evaluate_diagnosis(
+        _diagnosis([healthy.id, outage.id, deployment.id]),
+        incident_id=incident_id,
+        epoch=1,
+        evidence=[healthy, outage, deployment],
+        snapshot=_snapshot(),
+        known_good_revision=HEALTHY,
+        broken_revision=FAULTY,
+    )
+    assert decision.allowed is False
+    assert decision.reason == "dependencies_contradictory"
+
+
+def test_dependency_veto_is_order_independent() -> None:
+    incident_id = uuid4()
+    healthy_sample = _health(incident_id, deps_ok=True, observed_at=datetime(2026, 10, 12, 12, 0, tzinfo=timezone.utc))
+    outage = _health(incident_id, deps_ok=False, observed_at=datetime(2026, 10, 12, 12, 5, tzinfo=timezone.utc))
+    deployment = _deployment_evidence(incident_id)
+    for ordering in (
+        [healthy_sample, outage, deployment],
+        [deployment, outage, healthy_sample],
+        [outage, healthy_sample, deployment],
+    ):
+        decision = evaluate_diagnosis(
+            _diagnosis([healthy_sample.id, deployment.id]),
+            incident_id=incident_id,
+            epoch=1,
+            evidence=ordering,
+            snapshot=_snapshot(),
+            known_good_revision=HEALTHY,
+            broken_revision=FAULTY,
+        )
+        assert decision.allowed is False, ordering
+
+
+def test_missing_dependency_attestation_fails_closed_when_required() -> None:
+    incident_id = uuid4()
+    health = _evidence(
+        incident_id,
+        kind=EvidenceType.HEALTH,
+        payload={"functional_ok": False, "http_status": 500},
+    )
+    deployment = _deployment_evidence(incident_id)
+    decision = evaluate_diagnosis(
+        _diagnosis([health.id, deployment.id]),
+        incident_id=incident_id,
+        epoch=1,
+        evidence=[health, deployment],
+        snapshot=_snapshot(),
+        known_good_revision=HEALTHY,
+        broken_revision=FAULTY,
+        require_dependency_health=True,
+    )
+    assert decision.allowed is False
+    assert decision.reason == "dependency_evidence_missing"
+
+
+def test_missing_dependency_attestation_is_ignored_for_the_demo_default() -> None:
+    incident_id = uuid4()
+    health = _evidence(
+        incident_id,
+        kind=EvidenceType.HEALTH,
+        payload={"functional_ok": False, "http_status": 500},
+    )
+    deployment = _deployment_evidence(incident_id)
+    decision = evaluate_diagnosis(
+        _diagnosis([health.id, deployment.id]),
+        incident_id=incident_id,
+        epoch=1,
+        evidence=[health, deployment],
+        snapshot=_snapshot(),
+        known_good_revision=HEALTHY,
+        broken_revision=FAULTY,
+    )
+    assert decision.allowed is True
+
+
+def test_healthy_dependency_control_still_admits() -> None:
+    incident_id = uuid4()
+    health = _health(incident_id, deps_ok=True)
+    deployment = _deployment_evidence(incident_id)
+    decision = evaluate_diagnosis(
+        _diagnosis([health.id, deployment.id]),
+        incident_id=incident_id,
+        epoch=1,
+        evidence=[health, deployment],
+        snapshot=_snapshot(),
+        known_good_revision=HEALTHY,
+        broken_revision=FAULTY,
+        require_dependency_health=True,
+    )
+    assert decision.allowed is True
+    assert decision.target_revision == HEALTHY

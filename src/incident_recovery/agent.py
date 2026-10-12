@@ -86,26 +86,42 @@ def _is_functional_failure(evidence: Evidence) -> bool:
     return isinstance(status, int) and status >= 400
 
 
-def _is_dependency_failure(evidence: Evidence) -> bool:
-    """True when health evidence reports a failed dependency.
-
-    A dependency outage is *not* a deployment regression, so the gate must
-    escalate rather than admit a rollback.  Only evidence that explicitly
-    reports ``dependencies_ok`` is considered; demo evidence omits the field and
-    is therefore unaffected.
-    """
-
-    if evidence.evidence_type is not EvidenceType.HEALTH:
-        return False
-    payload = evidence.payload or {}
-    return payload.get("dependencies_ok") is False
-
-
 def _is_deployment_evidence(evidence: Evidence) -> bool:
     if evidence.evidence_type is not EvidenceType.DEPLOYMENT:
         return False
     payload = evidence.payload or {}
     return "generation" in payload and "current_revision" in payload
+
+
+def _dependency_veto(
+    scoped: list[Evidence], *, require_attestation: bool = False
+) -> Optional[str]:
+    """Return a refusal reason when the current epoch's dependency signal vetoes a rollback.
+
+    The veto deliberately considers **all** evidence in the current epoch rather
+    than only the evidence the model cited: a model that cites an earlier healthy
+    sample while omitting a later dependency outage must not be able to authorize
+    a rollback.  Contradictory dependency observations and (for a
+    dependency-attested workload such as staging) missing attestation fail closed.
+
+    The demo workload omits ``dependencies_ok`` entirely, so it is unaffected
+    unless it explicitly opts into attestation.
+    """
+
+    observations = [
+        evidence
+        for evidence in scoped
+        if evidence.evidence_type is EvidenceType.HEALTH
+        and isinstance((evidence.payload or {}).get("dependencies_ok"), bool)
+    ]
+    if not observations:
+        return "dependency_evidence_missing" if require_attestation else None
+    values = {(evidence.payload or {})["dependencies_ok"] for evidence in observations}
+    if len(values) > 1:
+        return "dependencies_contradictory"
+    if False in values:
+        return "dependencies_unhealthy"
+    return None
 
 
 def compute_proposal_digest(
@@ -135,6 +151,7 @@ def evaluate_diagnosis(
     snapshot,
     known_good_revision: str = INVESTIGATION_KNOWN_GOOD_TARGET,
     broken_revision: str = INVESTIGATION_BROKEN_REVISION,
+    require_dependency_health: bool = False,
 ) -> GateDecision:
     """Deterministic proposal gate; model confidence is irrelevant.
 
@@ -161,12 +178,18 @@ def evaluate_diagnosis(
     cited = [e for e in scoped if e.id in set(diagnosis.evidence_ids)]
     if any(_has_prompt_injection(e.payload or {}) for e in cited):
         return GateDecision(False, "prompt_injection")
+
+    # The dependency veto is evaluated over the whole current epoch, independent
+    # of citations: a newer/uncited dependency outage must veto a rollback even
+    # when the diagnosis cites only an earlier healthy sample.
+    dependency_reason = _dependency_veto(
+        scoped, require_attestation=require_dependency_health
+    )
+    if dependency_reason is not None:
+        return GateDecision(False, dependency_reason)
+
     if not any(_is_functional_failure(e) for e in cited):
         return GateDecision(False, "no_functional_failure")
-
-    if any(_is_dependency_failure(e) for e in cited):
-        # A healthy binary cannot repair a failed dependency; never roll back.
-        return GateDecision(False, "dependencies_unhealthy")
 
     deployments = [e for e in cited if _is_deployment_evidence(e)]
     if not deployments:
@@ -209,6 +232,7 @@ class InvestigationAgent:
         service_id: str = SERVICE_ID,
         known_good_revision: str = INVESTIGATION_KNOWN_GOOD_TARGET,
         broken_revision: str = INVESTIGATION_BROKEN_REVISION,
+        require_dependency_health: bool = False,
     ) -> None:
         self._repo = repo
         self._tools = tools
@@ -219,6 +243,7 @@ class InvestigationAgent:
         self._service_id = service_id
         self._known_good_revision = known_good_revision
         self._broken_revision = broken_revision
+        self._require_dependency_health = require_dependency_health
         # Server-enforced maxima: configured values may be lower but never higher.
         self._max_tool_calls = min(int(max_tool_calls), INVESTIGATION_MAX_TOOL_CALLS)
         self._max_seconds = min(float(max_seconds), INVESTIGATION_MAX_SECONDS)
@@ -375,6 +400,7 @@ class InvestigationAgent:
             snapshot=snapshot,
             known_good_revision=self._known_good_revision,
             broken_revision=self._broken_revision,
+            require_dependency_health=self._require_dependency_health,
         )
         if not decision.allowed:
             try:

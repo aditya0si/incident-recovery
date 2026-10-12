@@ -297,6 +297,23 @@ class OpenAICompatibleAdapter:
             # Scoped eligibility is checked *before* anything else; a blocked gate
             # can never reach the transport.
             policy.require_runtime_eligible()
+            # A billing refusal already recorded for the batch latches execution
+            # off: no later call may reach the transport.
+            if policy.billing_refused():
+                raise ProviderBillingRefusal(
+                    self._safe("provider_billing_refusal_latched")
+                )
+            # Authoritative admission is required before *any* turn or attempt.
+            # An unadmitted turn never reaches the transport, and no retry or
+            # adapter rebuild can bypass it.
+            if context is None:
+                admission = policy.check_smoke_admission()
+            else:
+                admission = policy.check_investigation_admission(context.incident_id)
+            if not admission.allowed:
+                raise ProviderBudgetExceeded(
+                    self._safe(f"provider_budget_{admission.reason}")
+                )
             session = policy.session_for(incident_id)
             max_input_chars = policy.limits.max_input_chars
             turn = policy.begin_turn(incident_id)
@@ -348,7 +365,13 @@ class OpenAICompatibleAdapter:
                 last_status = response.status_code
                 if self._is_billing_refusal(response):
                     # Account/billing refusal stops execution: no retry, no
-                    # automatic alternate model or tier.
+                    # automatic alternate model or tier.  The refusal is latched
+                    # persistently for the batch so every later call (and any
+                    # restarted process) refuses before transport.
+                    if policy is not None:
+                        policy.mark_billing_refused(
+                            f"provider_billing_refusal_{response.status_code}"
+                        )
                     raise ProviderBillingRefusal(
                         self._safe(f"provider_billing_refusal_{response.status_code}")
                     )

@@ -217,9 +217,9 @@ def test_cleanup_failure_never_upgrades_a_failed_case(manifest) -> None:
     assert with_cleanup.actual_outcome == "proposal_present"
 
 
-def test_cleanup_failure_does_not_override_the_primary_result(manifest) -> None:
-    # A passing case stays passing when only cleanup failed; the cleanup problem
-    # is recorded but never promotes or demotes the primary outcome.
+def test_cleanup_failure_fails_the_case_and_is_never_hidden(manifest) -> None:
+    # A passing-looking case with a failed cleanup does not pass: the source
+    # state was not restored, so the outcome is unverified.
     case = manifest.case("broken-revision-1")
     passed = _record(
         case,
@@ -229,13 +229,49 @@ def test_cleanup_failure_does_not_override_the_primary_result(manifest) -> None:
         proposal=True,
         recovery_verified=True,
     )
-    cleaned = passed.with_cleanup(False)
-    assert cleaned.status == "passed"
-    assert cleaned.actual_outcome == "recovered"
+    assert ev.case_passed(passed) is True
+    cleaned = passed.with_cleanup(False, "switch_restore_error")
     assert cleaned.cleanup_ok is False
+    assert cleaned.cleanup_detail == "switch_restore_error"
+    assert cleaned.actual_outcome == "recovered"
+    assert ev.case_passed(cleaned) is False
     # A failed case is never upgraded to passed by a *successful* cleanup either.
     failed = _record(case, manifest, status="failed", actual_outcome="unresolved")
     assert failed.with_cleanup(True).status == "failed"
+    assert ev.case_passed(failed.with_cleanup(True)) is False
+
+
+def test_metrics_count_cleanup_failures_and_fail_safety(manifest) -> None:
+    records = [
+        _record(
+            manifest.case("broken-revision-1"),
+            manifest,
+            actual_outcome="recovered",
+            proposal=True,
+            approval=True,
+            recovery_verified=True,
+            gate_reason="proposed",
+            cleanup_ok=False,
+            cleanup_detail="dependency_restart_failed",
+        ),
+        _record(manifest.case("dependency-outage-1"), manifest),
+    ]
+    metrics = ev.compute_metrics(records, manifest)
+    assert metrics["cleanup_failures"] == 1
+    assert metrics["cleanup_established"] is True
+    assert metrics["cleanup_ok"] is False
+    assert metrics["safety_established"] is True
+    assert metrics["safety_ok"] is False
+
+
+def test_metrics_cleanup_is_not_established_without_execution(manifest) -> None:
+    records = ev.blocked_live_records(
+        manifest,
+        ev.ArtifactVersions(source_sha="a6f715a", image="x", adapter="provider-policy-blocked"),
+    )
+    metrics = ev.compute_metrics(records, manifest, live=True)
+    assert metrics["cleanup_established"] is False
+    assert metrics["cleanup_ok"] is None
 
 
 # --- outcome classifier is not circular ---------------------------------------
@@ -404,3 +440,128 @@ def test_scripted_utility_is_explicitly_orchestration_scoped(manifest) -> None:
     assert metrics["orchestration_utility_ok"] is True
     # The legacy key stays, but it is unambiguously the orchestration signal.
     assert metrics["utility_ok"] == metrics["orchestration_utility_ok"]
+
+
+# --- run header binds mode / adapter / execution identity ----------------------
+
+
+def _blocked(manifest) -> list[ev.CaseRecord]:
+    return ev.blocked_live_records(
+        manifest,
+        ev.ArtifactVersions(source_sha="a6f715a", image="img", adapter="provider-policy-blocked"),
+    )
+
+
+def test_begin_writes_an_immutable_header_binding_mode(tmp_path: Path, manifest) -> None:
+    store = ev.RunStore(tmp_path / "runs", "run-h")
+    store.begin(
+        manifest, mode="live", adapter="provider-policy-blocked", execution_identity="img"
+    )
+    header = store.read_header()
+    assert header is not None
+    assert header["mode"] == "live"
+    assert header["adapter"] == "provider-policy-blocked"
+    assert header["execution_identity"] == "img"
+    assert header["manifest_hash"] == manifest.manifest_hash
+
+
+def test_begin_rejects_cross_mode_and_identity_reuse(tmp_path: Path, manifest) -> None:
+    store = ev.RunStore(tmp_path / "runs", "run-x")
+    store.begin(manifest, mode="scripted", adapter="scripted:tenant-api-staging", execution_identity="img")
+    with pytest.raises(ev.ManifestMutationError):
+        ev.RunStore(tmp_path / "runs", "run-x").begin(
+            manifest, mode="live", adapter="provider-policy-blocked", execution_identity="img"
+        )
+    with pytest.raises(ev.ManifestMutationError):
+        ev.RunStore(tmp_path / "runs", "run-x").begin(
+            manifest, mode="scripted", adapter="different-adapter", execution_identity="img"
+        )
+    with pytest.raises(ev.ManifestMutationError):
+        ev.RunStore(tmp_path / "runs", "run-x").begin(
+            manifest, mode="scripted", adapter="scripted:tenant-api-staging", execution_identity="other"
+        )
+
+
+def test_begin_rejects_an_unknown_mode(tmp_path: Path, manifest) -> None:
+    with pytest.raises(ev.ManifestError):
+        ev.RunStore(tmp_path / "runs", "run-m").begin(manifest, mode="sneaky")
+
+
+def test_write_case_rejects_a_record_with_the_wrong_mode(tmp_path: Path, manifest) -> None:
+    store = ev.RunStore(tmp_path / "runs", "run-mode")
+    store.begin(manifest, mode="live", adapter="provider-policy-blocked", execution_identity="img")
+    record = _blocked(manifest)[0]
+    store.write_case(record)  # live=True matches mode=live
+    wrong = replace(record, case_id=record.case_id, live=False)
+    with pytest.raises(ev.ManifestMutationError):
+        store.write_case(wrong)
+
+
+def test_resume_with_same_identity_is_allowed(tmp_path: Path, manifest) -> None:
+    store = ev.RunStore(tmp_path / "runs", "run-r")
+    store.begin(manifest, mode="live", adapter="provider-policy-blocked", execution_identity="img")
+    # A second begin with the same mode/identity reuses the run cleanly.
+    ev.RunStore(tmp_path / "runs", "run-r").begin(
+        manifest, mode="live", adapter="provider-policy-blocked", execution_identity="img"
+    )
+
+
+# --- stored manifest hash is recomputed, never trusted ------------------------
+
+
+def test_tampered_stored_manifest_hash_is_detected(tmp_path: Path, manifest) -> None:
+    store = ev.RunStore(tmp_path / "runs", "run-t")
+    store.begin(manifest)
+    data = json.loads((store.run_dir / "manifest.json").read_text(encoding="utf-8"))
+    data["cases"][0]["expected_outcome"] = "escalated_no_proposal"  # hash left stale
+    (store.run_dir / "manifest.json").write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ev.ManifestMutationError):
+        store.recorded_manifest_hash()
+
+
+def test_resume_refuses_a_content_tampered_manifest_even_with_updated_hash(
+    tmp_path: Path, manifest
+) -> None:
+    store = ev.RunStore(tmp_path / "runs", "run-t2")
+    store.begin(manifest, mode="scripted")
+    data = json.loads((store.run_dir / "manifest.json").read_text(encoding="utf-8"))
+    data["cases"][0]["expected_outcome"] = "escalated_no_proposal"
+    # Recompute and store a matching hash so the stale-hash check cannot help.
+    tampered_hash = ev.validate_manifest_dict(
+        {
+            "version": data["version"],
+            "label_version": data["label_version"],
+            "service_id": data["service_id"],
+            "cases": data["cases"],
+        }
+    ).manifest_hash
+    data["manifest_hash"] = tampered_hash
+    (store.run_dir / "manifest.json").write_text(json.dumps(data), encoding="utf-8")
+    # `recorded_manifest_hash` now returns the tampered, self-consistent hash ...
+    assert store.recorded_manifest_hash() == tampered_hash
+    # ... but the approved manifest's content no longer matches, so resume refuses.
+    with pytest.raises(ev.ManifestMutationError):
+        ev.RunStore(tmp_path / "runs", "run-t2").begin(manifest, mode="scripted")
+
+
+def test_read_case_rejects_a_tampered_case_definition(tmp_path: Path, manifest) -> None:
+    store = ev.RunStore(tmp_path / "runs", "run-c")
+    store.begin(manifest)
+    case = manifest.case("broken-revision-1")
+    store.write_case(_record(case, manifest))
+    path = store.cases_dir / "broken-revision-1.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["expected_outcome"] = "escalated_no_proposal"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ev.ManifestMutationError):
+        store.read_case("broken-revision-1")
+
+
+def test_existing_records_rejects_a_foreign_manifest(tmp_path: Path, manifest) -> None:
+    store = ev.RunStore(tmp_path / "runs", "run-f")
+    store.begin(manifest)
+    mutated = copy.deepcopy(_raw_manifest())
+    mutated["cases"][0]["expected_outcome"] = "escalated_no_proposal"
+    changed = ev.load_scenarios(_write(tmp_path, mutated))
+    with pytest.raises(ev.ManifestMutationError):
+        store.existing_records(changed)

@@ -223,8 +223,28 @@ async def test_rejection_never_creates_operation_and_no_switch(
     assert harness.switch.calls == []
 
 
-# --- validation: digest, service, target, generation ------------------------
+async def test_reject_refuses_a_foreign_incident_and_leaves_it_unchanged(
+    harness: ApiHarness,
+) -> None:
+    """A foreign service's awaiting-approval incident cannot be rejected (404)."""
 
+    foreign, _ = await harness.repo.ingest_alert(
+        _key("foreign"), "foreign-service", "foreign incident", {}
+    )
+    await harness.repo.transition(foreign.id, IncidentState.INVESTIGATING)
+    await harness.repo.transition(foreign.id, IncidentState.AWAITING_APPROVAL)
+
+    response = await harness.client.post(
+        f"/incidents/{foreign.id}/reject",
+        json={"actor": "mallory", "reason": "cross-service"},
+        headers=harness.auth(),
+    )
+    assert response.status_code == 404, response.text
+    unchanged = await harness.repo.get_incident(foreign.id)
+    assert unchanged is not None and unchanged.state is IncidentState.AWAITING_APPROVAL
+
+
+# --- validation: digest, service, target, generation ------------------------
 
 async def test_unknown_digest_is_refused(harness: ApiHarness) -> None:
     incident, _ = await _awaiting_incident_with_proposal(harness.repo, harness.store)
@@ -304,6 +324,46 @@ async def test_expired_approval_fails_closed_and_does_not_switch(
     result = await executor.execute(operation.id)
     assert result.status == OPERATION_FAILED
     assert (await store.get_snapshot()).revision == BROKEN
+
+
+async def test_executor_dependency_recheck_refuses_rollback_when_dependencies_fail(
+    repo: IncidentRepository, store: DeploymentStore
+) -> None:
+    """A deployment that became dependency-unhealthy after approval is not rolled back."""
+
+    incident, proposal = await _awaiting_incident_with_proposal(repo, store)
+    _, operation, _ = await repo.approve_incident(incident.id, proposal.digest, "alice", now=utcnow())
+
+    async def unhealthy() -> bool:
+        return False
+
+    executor = RecoveryExecutor(
+        repo, _store_client(store), store, clock=lambda: BASE, dependency_check=unhealthy
+    )
+    result = await executor.execute(operation.id)
+    assert result.status == OPERATION_FAILED
+    assert result.last_error == "dependencies_unhealthy"
+    # The rollback never happened and the approval was not consumed by the refusal.
+    assert (await store.get_snapshot()).revision == BROKEN
+    approval = await repo.get_approval_for_incident(incident.id)
+    assert approval is not None and approval.consumed_by_operation is None
+
+
+async def test_executor_dependency_recheck_allows_rollback_when_dependencies_healthy(
+    repo: IncidentRepository, store: DeploymentStore
+) -> None:
+    incident, proposal = await _awaiting_incident_with_proposal(repo, store)
+    _, operation, _ = await repo.approve_incident(incident.id, proposal.digest, "alice", now=utcnow())
+
+    async def healthy() -> bool:
+        return True
+
+    executor = RecoveryExecutor(
+        repo, _store_client(store), store, clock=lambda: BASE, dependency_check=healthy
+    )
+    executed = await executor.execute(operation.id)
+    assert executed.status == OPERATION_EXECUTED
+    assert (await store.get_snapshot()).revision == HEALTHY
 
 
 async def test_consumed_approval_cannot_authorize_second_operation(

@@ -96,6 +96,8 @@ def _scripted() -> dict:
             "policy_refusals": 10,
             "unauthorized_writes": 0,
             "forbidden_admissions": 0,
+            "cleanup_failures": 0,
+            "cleanup_ok": True,
         },
     }
 
@@ -203,6 +205,7 @@ def _case(case_id: str, *, live: bool) -> dict:
         "provider_transport_attempted": False,
         "tokens": None,
         "cost": None,
+        "cleanup_ok": True,
     }
 
 
@@ -228,3 +231,47 @@ def test_case_contract_rejects_wrong_count_and_executed_live() -> None:
     live[3]["executed"] = True
     live[3]["status"] = "passed"
     assert sv.evaluate_case_records(live, live=True)[0] is False
+
+
+def test_case_contract_rejects_incomplete_cleanup_for_scripted() -> None:
+    scripted = [_case(f"c{i}", live=False) for i in range(12)]
+    scripted[0]["cleanup_ok"] = False
+    ok, detail = sv.evaluate_case_records(scripted, live=False)
+    assert ok is False
+    assert "cleanup" in detail
+
+
+# --- restore gate / overall exit code -----------------------------------------
+
+
+def test_restore_records_each_command_exit_as_a_required_gate(tmp_path: Path, monkeypatch) -> None:
+    driver = sv.Driver(sv.parse_args(["--evidence-dir", str(tmp_path)]))
+    calls: list[list[str]] = []
+
+    def failing_run(argv, *, timeout, env=None, sanitizer=None, log_path=None):
+        calls.append(argv)
+        return sv.Result(returncode=1, output="boom", duration=0.5, timed_out=False)
+
+    monkeypatch.setattr(sv, "run", failing_run)
+    checks = driver.restore()
+    assert len(checks) == 2
+    assert all(check.gate == "environment_restore" for check in checks)
+    assert all(check.status == "failed" for check in checks)
+    assert all(check.exit_code == 1 for check in checks)
+    assert len(calls) == 2
+
+
+def test_restore_marks_commands_passing_on_zero_exit(tmp_path: Path, monkeypatch) -> None:
+    driver = sv.Driver(sv.parse_args(["--evidence-dir", str(tmp_path)]))
+    monkeypatch.setattr(
+        sv, "run", lambda *a, **k: sv.Result(returncode=0, output="", duration=0.1, timed_out=False)
+    )
+    checks = driver.restore()
+    assert all(check.status == "passed" for check in checks)
+
+
+def test_overall_exit_code_requires_a_successful_restore() -> None:
+    assert sv.overall_exit_code(True, True, True) == 0
+    assert sv.overall_exit_code(True, True, False) == 1
+    assert sv.overall_exit_code(True, False, True) == 1
+    assert sv.overall_exit_code(False, True, True) == 1

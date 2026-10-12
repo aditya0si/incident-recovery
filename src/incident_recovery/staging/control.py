@@ -187,6 +187,7 @@ def create_staging_api_app(
                 body.actor,
                 reason=body.reason,
                 proposal_digest=body.proposal_digest,
+                service_id=STAGING_SERVICE_ID,
             )
         except NotFound:
             raise HTTPException(status_code=404, detail="incident_not_found")
@@ -343,6 +344,7 @@ def build_staging_worker(repo, pool, env: dict):
         service_id=profile.service_id,
         known_good_revision=profile.known_good_revision(),
         broken_revision=profile.broken_revision(),
+        require_dependency_health=True,
         max_tool_calls=int(env.get("INVESTIGATION_MAX_TOOL_CALLS", "12")),
         max_seconds=float(env.get("INVESTIGATION_MAX_SECONDS", "120")),
     )

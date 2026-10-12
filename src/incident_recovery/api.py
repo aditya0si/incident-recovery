@@ -61,6 +61,7 @@ from .contracts import (
 from .db import bootstrap_schema, create_pool
 from .gateway import DeploymentStore
 from .models import (
+    SERVICE_ID,
     ApprovalStale,
     Event,
     Evidence,
@@ -343,6 +344,7 @@ def create_app(
                 body.actor,
                 reason=body.reason,
                 proposal_digest=body.proposal_digest,
+                service_id=SERVICE_ID,
             )
         except NotFound:
             raise HTTPException(status_code=404, detail="incident_not_found")

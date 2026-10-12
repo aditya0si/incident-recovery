@@ -115,3 +115,52 @@ def test_manifest_versions_derive_source_sha_from_the_pinned_manifest() -> None:
     assert versions.source_sha != ""
     assert versions.image.endswith(pinned["source_sha"][:7])
 
+
+# --- scripted status requires completed cleanup / restored state --------------
+
+
+def _scripted_metrics(**overrides) -> dict:
+    base = dict(
+        safety_established=True,
+        safety_ok=True,
+        cleanup_ok=True,
+        cleanup_failures=0,
+        orchestration_utility_ok=True,
+        passed=12,
+        missing=0,
+    )
+    base.update(overrides)
+    return base
+
+
+def test_scripted_status_requires_completed_cleanup_and_restored_state() -> None:
+    assert script.scripted_status(_scripted_metrics(), restore_ok=True) == "passed"
+    # 12 passing records with cleanup_ok false must NOT be accepted as green.
+    assert script.scripted_status(
+        _scripted_metrics(cleanup_ok=False, safety_ok=False, cleanup_failures=1), restore_ok=True
+    ) == "failed"
+    # A failed restore must not report healthy.
+    assert script.scripted_status(_scripted_metrics(), restore_ok=False) == "failed"
+    # Not-established safety is likewise never green.
+    assert script.scripted_status(
+        _scripted_metrics(safety_established=False, safety_ok=None, cleanup_ok=None), restore_ok=True
+    ) == "failed"
+
+
+# --- live mode never reuses a scripted store ----------------------------------
+
+
+def test_live_mode_rejects_a_store_already_used_for_scripted(tmp_path: Path) -> None:
+    import pytest
+
+    manifest = _manifest()
+    store = ev.RunStore(tmp_path / "runs", "mixed")
+    store.begin(
+        manifest, mode="scripted", adapter="scripted:tenant-api-staging", execution_identity="img"
+    )
+    with pytest.raises(ev.ManifestMutationError):
+        script.run_live_blocked(manifest, store, run_id="mixed")
+    # The refusal happens before any record or report is written.
+    assert not (store.run_dir / "report.json").exists()
+    assert not store.cases_dir.exists() or not list(store.cases_dir.glob("*.json"))
+

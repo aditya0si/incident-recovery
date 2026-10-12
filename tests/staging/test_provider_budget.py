@@ -276,8 +276,9 @@ def _adapter(tmp_path: Path, handler, *, ledger: policy.JsonBudgetLedger, max_re
 async def test_adapter_refuses_once_turn_budget_is_exhausted(tmp_path: Path) -> None:
     calls: list[httpx.Request] = []
     ledger = _ledger(tmp_path, max_turns_per_incident=1)
-    adapter, _ = _adapter(tmp_path, _ok_handler(calls), ledger=ledger)
+    adapter, provider_policy = _adapter(tmp_path, _ok_handler(calls), ledger=ledger)
     incident_id = uuid4()
+    provider_policy.admit_investigation(incident_id)
     await adapter.next_step(_context(incident_id))
     with pytest.raises(policy.ProviderBudgetExceeded):
         await adapter.next_step(_context(incident_id))
@@ -293,9 +294,11 @@ async def test_retries_are_counted_and_cannot_exceed_the_paid_cap(tmp_path: Path
         return httpx.Response(503, json={"error": "busy"})
 
     ledger = _ledger(tmp_path, max_turns_per_incident=1, max_attempts_per_incident=2)
-    adapter, _ = _adapter(tmp_path, handler, ledger=ledger, max_retries=5)
+    adapter, provider_policy = _adapter(tmp_path, handler, ledger=ledger, max_retries=5)
+    incident_id = uuid4()
+    provider_policy.admit_investigation(incident_id)
     with pytest.raises(policy.ProviderBudgetExceeded):
-        await adapter.next_step(_context(uuid4()))
+        await adapter.next_step(_context(incident_id))
     assert calls["n"] == 2, "retries must stop at the paid attempt cap"
     await adapter.aclose()
 
@@ -303,8 +306,10 @@ async def test_retries_are_counted_and_cannot_exceed_the_paid_cap(tmp_path: Path
 async def test_staging_request_is_bounded_to_input_and_output_limits(tmp_path: Path) -> None:
     calls: list[httpx.Request] = []
     ledger = _ledger(tmp_path)
-    adapter, _ = _adapter(tmp_path, _ok_handler(calls), ledger=ledger, max_tokens=4096)
-    await adapter.next_step(_context(huge_observations=40))
+    adapter, provider_policy = _adapter(tmp_path, _ok_handler(calls), ledger=ledger, max_tokens=4096)
+    context = _context(huge_observations=40)
+    provider_policy.admit_investigation(context.incident_id)
+    await adapter.next_step(context)
     assert len(calls) == 1
     body = json.loads(calls[0].content)
     assert body["max_tokens"] == 4096
@@ -318,7 +323,9 @@ async def test_usage_recorded_and_ledger_file_has_no_secret(tmp_path: Path) -> N
     ledger_path = tmp_path / "provider_budget.json"
     ledger = policy.JsonBudgetLedger(ledger_path)
     adapter, provider_policy = _adapter(tmp_path, _ok_handler(calls), ledger=ledger)
-    await adapter.next_step(_context(uuid4()))
+    context = _context(uuid4())
+    provider_policy.admit_investigation(context.incident_id)
+    await adapter.next_step(context)
     snapshot = provider_policy.snapshot()
     recorded = [usage for usage in snapshot["usage"].values()]
     assert recorded and recorded[-1]["output_tokens"] == 9
@@ -326,3 +333,95 @@ async def test_usage_recorded_and_ledger_file_has_no_secret(tmp_path: Path) -> N
     assert SYNTHETIC_KEY not in raw
     assert "Bearer" not in raw
     await adapter.aclose()
+
+
+# --- cross-instance / cross-process integrity ---------------------------------
+
+
+def test_two_preloaded_instances_do_not_both_admit(tmp_path: Path) -> None:
+    """Two instances over the same path must not both act on a stale snapshot."""
+
+    path = tmp_path / "provider_budget.json"
+    limits = replace(policy.ProviderLimits(), max_investigations=1)
+    first = policy.JsonBudgetLedger(path, limits=limits)
+    second = policy.JsonBudgetLedger(path, limits=limits)
+    # Both were constructed (preloaded) before either admits.
+    assert first.admit_investigation("a").allowed is True
+    blocked = second.admit_investigation("b")
+    assert blocked.allowed is False
+    assert blocked.reason == "concurrency_limit"
+    # The disk state retains the *winner*, never a divergent second snapshot.
+    snapshot = policy.JsonBudgetLedger(path, limits=limits).snapshot()
+    assert snapshot["admitted"] == ["a"]
+    assert snapshot["active_investigation"] == "a"
+
+
+def test_two_instances_share_a_single_batch_cap(tmp_path: Path) -> None:
+    path = tmp_path / "provider_budget.json"
+    limits = replace(policy.ProviderLimits(), max_investigations=2)
+    first = policy.JsonBudgetLedger(path, limits=limits)
+    second = policy.JsonBudgetLedger(path, limits=limits)
+    assert first.admit_investigation("a").allowed
+    first.release_investigation("a")
+    assert second.admit_investigation("b").allowed
+    second.release_investigation("b")
+    # A third admission through either instance sees both prior admissions.
+    assert first.admit_investigation("c").allowed is False
+    assert first.admit_investigation("c").reason == "batch_limit"
+    assert second.admit_investigation("d").allowed is False
+
+
+def test_billing_latch_persists_across_instances(tmp_path: Path) -> None:
+    path = tmp_path / "provider_budget.json"
+    first = policy.JsonBudgetLedger(path)
+    assert first.billing_refused() is False
+    first.mark_billing_refused("provider_billing_refusal_402")
+    second = policy.JsonBudgetLedger(path)
+    assert second.billing_refused() is True
+    assert second.billing_reason() == "provider_billing_refusal_402"
+    # Latched billing never resets by constructing a new ledger.
+    assert policy.JsonBudgetLedger(path).billing_refused() is True
+
+
+def test_malformed_existing_ledger_refuses_to_load(tmp_path: Path) -> None:
+    path = tmp_path / "provider_budget.json"
+    path.write_text("{not json", encoding="utf-8")
+    with pytest.raises(policy.ProviderPolicyError):
+        policy.JsonBudgetLedger(path)
+
+
+def test_multiprocess_concurrent_admission_is_serialized(tmp_path: Path) -> None:
+    """Two real OS processes racing to admit must yield exactly one admission."""
+
+    import subprocess
+    import sys
+
+    path = tmp_path / "provider_budget.json"
+    code = (
+        "import sys, json\n"
+        "from dataclasses import replace\n"
+        "from incident_recovery import provider_policy as p\n"
+        "led = p.JsonBudgetLedger(sys.argv[1], limits=replace(p.ProviderLimits(), max_investigations=1))\n"
+        "d = led.admit_investigation(sys.argv[2])\n"
+        "print(json.dumps({'allowed': d.allowed, 'reason': d.reason}))\n"
+    )
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", code, str(path), incident],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for incident in ("a", "b")
+    ]
+    results = []
+    for proc in procs:
+        out, err = proc.communicate(timeout=60)
+        assert proc.returncode == 0, err
+        results.append(json.loads(out.strip().splitlines()[-1]))
+    assert sum(1 for r in results if r["allowed"]) == 1, results
+    limits = replace(policy.ProviderLimits(), max_investigations=1)
+    snapshot = policy.JsonBudgetLedger(path, limits=limits).snapshot()
+    assert len(snapshot["admitted"]) == 1
+    assert snapshot["active_investigation"] == snapshot["admitted"][0]
+

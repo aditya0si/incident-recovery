@@ -36,6 +36,7 @@ adapter routes every error string through the shared redaction helpers.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import json
 import os
@@ -44,7 +45,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping, Optional, Protocol
+from typing import Any, Iterator, Mapping, Optional, Protocol
 from uuid import UUID, uuid5
 
 from .models import InvestigationBudgetExhausted, ModelUnavailable, utcnow
@@ -298,10 +299,62 @@ class BudgetDecision:
 
 # --- durable ledger -----------------------------------------------------------
 
+LEDGER_SCHEMA = 2
+
+
+if os.name == "nt":  # pragma: no cover - exercised on Windows CI/host
+    import msvcrt
+
+    def _lock_fd(fd: int) -> None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+
+    def _unlock_fd(fd: int) -> None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        try:
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        except OSError:  # already released / closed
+            pass
+
+else:  # pragma: no cover - POSIX path
+    import fcntl
+
+    def _lock_fd(fd: int) -> None:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+
+    def _unlock_fd(fd: int) -> None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def _interprocess_lock(lock_path: Path) -> Iterator[None]:
+    """A cross-process exclusive lock that is released automatically on exit.
+
+    The lock is file-descriptor/owned-process scoped, so a crashed holder never
+    orphans it (unlike an ``O_EXCL`` sentinel).  It serializes every mutation of
+    the ledger so that two instances -- in one process or across processes --
+    can never both read a stale snapshot and then write divergent state.
+    """
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT)
+    try:
+        if os.fstat(fd).st_size == 0:
+            # Some platforms cannot lock an empty region; seed one byte.
+            os.write(fd, b"\0")
+        _lock_fd(fd)
+        try:
+            yield
+        finally:
+            _unlock_fd(fd)
+    finally:
+        os.close(fd)
+
 
 def _empty_state() -> dict:
     return {
-        "version": 1,
+        "schema": LEDGER_SCHEMA,
+        "scope": GO_RUNTIME_SCOPE,
         "smoke_calls": 0,
         "admitted": [],
         "active_investigation": None,
@@ -309,6 +362,8 @@ def _empty_state() -> dict:
         "attempts": {},
         "input_chars": {},
         "usage": {},
+        "billing_refused": False,
+        "billing_reason": None,
         "updated_at": None,
     }
 
@@ -331,6 +386,9 @@ def _normalize_state(data: Any) -> dict:
         state["usage"] = {
             str(k): dict(v) for k, v in raw_usage.items() if isinstance(v, Mapping)
         }
+    state["billing_refused"] = bool(data.get("billing_refused", False))
+    reason = data.get("billing_reason")
+    state["billing_reason"] = redact_secrets(str(reason)) if reason is not None else None
     state["updated_at"] = data.get("updated_at")
     return state
 
@@ -370,6 +428,14 @@ class BudgetLedger(Protocol):
 
     def admit_smoke(self) -> BudgetDecision: ...
 
+    def is_admitted(self, incident_id: Any) -> bool: ...
+
+    def smoke_admitted(self) -> bool: ...
+
+    def mark_billing_refused(self, reason: Optional[str] = None) -> None: ...
+
+    def billing_refused(self) -> bool: ...
+
     def begin_turn(self, incident_id: Any) -> BudgetDecision: ...
 
     def begin_attempt(self, incident_id: Any) -> BudgetDecision: ...
@@ -390,9 +456,13 @@ class BudgetLedger(Protocol):
 class JsonBudgetLedger:
     """A staging-scoped, restart-persistent JSON ledger.
 
-    Every mutation is persisted atomically to ``path`` before it returns, so a
-    new process (or a new instance over the same path) observes the *same*
-    counters.  There are no module-global counters.
+    Every mutation runs inside a *cross-process* transaction: an exclusive file
+    lock is taken, the state is re-read from disk, the mutation is applied to
+    that fresh state, and the result is persisted atomically before the lock is
+    released.  There is no per-instance cache, so two instances (in one process
+    or in separate processes) can never both act on a stale snapshot.  There are
+    no module-global counters, and a crashed holder releases the lock
+    automatically rather than orphaning it.
     """
 
     def __init__(
@@ -406,7 +476,10 @@ class JsonBudgetLedger:
         self._limits = limits or ProviderLimits()
         self._clock = clock
         self._lock = threading.RLock()
-        self._state = self._load()
+        self._lock_path = self._path.with_name(self._path.name + ".lock")
+        # Fail closed on an unreadable existing ledger at construction time.
+        with self._locked_read():
+            pass
 
     @property
     def limits(self) -> ProviderLimits:
@@ -416,7 +489,27 @@ class JsonBudgetLedger:
     def path(self) -> Path:
         return self._path
 
-    def _load(self) -> dict:
+    @property
+    def lock_path(self) -> Path:
+        return self._lock_path
+
+    # -- transaction primitives --
+
+    @contextlib.contextmanager
+    def _locked_read(self) -> Iterator[dict]:
+        with self._lock:
+            with _interprocess_lock(self._lock_path):
+                yield self._read()
+
+    @contextlib.contextmanager
+    def _locked_write(self) -> Iterator[dict]:
+        with self._lock:
+            with _interprocess_lock(self._lock_path):
+                state = self._read()
+                yield state
+                self._write(state)
+
+    def _read(self) -> dict:
         if not self._path.is_file():
             return _empty_state()
         try:
@@ -424,7 +517,7 @@ class JsonBudgetLedger:
         except (OSError, ValueError) as exc:
             raise ProviderPolicyError("provider_budget_ledger_unreadable") from exc
 
-    def _persist(self, state: dict) -> None:
+    def _write(self, state: dict) -> None:
         state["updated_at"] = self._clock().isoformat()
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._path.with_name(self._path.name + ".tmp")
@@ -432,23 +525,20 @@ class JsonBudgetLedger:
             json.dumps(state, separators=(",", ":"), sort_keys=True), encoding="utf-8"
         )
         os.replace(tmp, self._path)
-        self._state = state
 
     def snapshot(self) -> dict:
-        with self._lock:
-            return _redact_snapshot(copy.deepcopy(self._state))
+        with self._locked_read() as state:
+            return _redact_snapshot(copy.deepcopy(state))
 
     # -- admissions --
 
     def admit_investigation(self, incident_id: str) -> BudgetDecision:
         key = str(incident_id)
-        with self._lock:
-            state = copy.deepcopy(self._state)
+        with self._locked_write() as state:
             if state["active_investigation"] not in (None, key):
                 return BudgetDecision(False, "concurrency_limit")
             if key in state["admitted"]:
                 state["active_investigation"] = key
-                self._persist(state)
                 return BudgetDecision(True, "already_admitted")
             if len(state["admitted"]) >= self._limits.max_investigations:
                 return BudgetDecision(
@@ -457,52 +547,66 @@ class JsonBudgetLedger:
                 )
             state["admitted"].append(key)
             state["active_investigation"] = key
-            self._persist(state)
             remaining = self._limits.max_investigations - len(state["admitted"])
             return BudgetDecision(True, "admitted", remaining)
 
     def release_investigation(self, incident_id: str) -> None:
         key = str(incident_id)
-        with self._lock:
-            if self._state["active_investigation"] == key:
-                state = copy.deepcopy(self._state)
+        with self._locked_write() as state:
+            if state["active_investigation"] == key:
                 state["active_investigation"] = None
-                self._persist(state)
 
     def admit_smoke(self) -> BudgetDecision:
-        with self._lock:
-            state = copy.deepcopy(self._state)
+        with self._locked_write() as state:
             if state["active_investigation"] is not None:
                 return BudgetDecision(False, "concurrency_limit")
             if state["smoke_calls"] >= self._limits.max_smoke_calls:
                 return BudgetDecision(False, "smoke_limit", 0)
             state["smoke_calls"] += 1
-            self._persist(state)
             remaining = self._limits.max_smoke_calls - state["smoke_calls"]
             return BudgetDecision(True, "smoke_admitted", remaining)
+
+    def is_admitted(self, incident_id: Any) -> bool:
+        key = str(incident_id)
+        with self._locked_read() as state:
+            return state["active_investigation"] == key and key in state["admitted"]
+
+    def smoke_admitted(self) -> bool:
+        with self._locked_read() as state:
+            return int(state["smoke_calls"]) >= 1
+
+    def mark_billing_refused(self, reason: Optional[str] = None) -> None:
+        with self._locked_write() as state:
+            state["billing_refused"] = True
+            if reason is not None:
+                state["billing_reason"] = redact_secrets(str(reason))
+
+    def billing_refused(self) -> bool:
+        with self._locked_read() as state:
+            return bool(state["billing_refused"])
+
+    def billing_reason(self) -> Optional[str]:
+        with self._locked_read() as state:
+            return state.get("billing_reason")
 
     # -- per-turn / per-attempt --
 
     def begin_turn(self, incident_id: Any) -> BudgetDecision:
         key = _ledger_key(incident_id)
-        with self._lock:
-            state = copy.deepcopy(self._state)
+        with self._locked_write() as state:
             used = int(state["turns"].get(key, 0))
             if used >= self._limits.max_turns_per_incident:
                 return BudgetDecision(False, "turn_limit", 0)
             state["turns"][key] = used + 1
-            self._persist(state)
             return BudgetDecision(True, "turn", self._limits.max_turns_per_incident - used - 1)
 
     def begin_attempt(self, incident_id: Any) -> BudgetDecision:
         key = _ledger_key(incident_id)
-        with self._lock:
-            state = copy.deepcopy(self._state)
+        with self._locked_write() as state:
             used = int(state["attempts"].get(key, 0))
             if used >= self._limits.max_attempts_per_incident:
                 return BudgetDecision(False, "attempt_limit", 0)
             state["attempts"][key] = used + 1
-            self._persist(state)
             return BudgetDecision(
                 True, "attempt", self._limits.max_attempts_per_incident - used - 1
             )
@@ -515,10 +619,8 @@ class JsonBudgetLedger:
             return BudgetDecision(False, "invalid_input_chars")
         if input_chars > self._limits.max_input_chars:
             return BudgetDecision(False, "input_limit", 0)
-        with self._lock:
-            state = copy.deepcopy(self._state)
+        with self._locked_write() as state:
             state["input_chars"][key] = int(state["input_chars"].get(key, 0)) + input_chars
-            self._persist(state)
         return BudgetDecision(True, "input_recorded")
 
     def record_output(
@@ -551,8 +653,7 @@ class JsonBudgetLedger:
         if not (isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0):
             cost = None
 
-        with self._lock:
-            state = copy.deepcopy(self._state)
+        with self._locked_write() as state:
             entry = state["usage"].setdefault(
                 key,
                 {"input_tokens": None, "output_tokens": None, "total_tokens": None, "cost": None},
@@ -565,7 +666,6 @@ class JsonBudgetLedger:
                 entry["total_tokens"] = (entry["total_tokens"] or 0) + total_tokens
             if cost is not None:
                 entry["cost"] = (entry["cost"] or 0.0) + float(cost)
-            self._persist(state)
         return BudgetDecision(True, "usage_recorded")
 
 
@@ -637,6 +737,28 @@ class StagingProviderPolicy:
     def admit_smoke(self) -> BudgetDecision:
         self.require_runtime_eligible()
         return self._ledger.admit_smoke()
+
+    def check_investigation_admission(self, incident_id: Any) -> BudgetDecision:
+        """Refuse any provider turn for an incident that is not currently admitted."""
+
+        self.require_runtime_eligible()
+        if self._ledger.is_admitted(str(incident_id)):
+            return BudgetDecision(True, "admitted")
+        return BudgetDecision(False, "investigation_not_admitted")
+
+    def check_smoke_admission(self) -> BudgetDecision:
+        """Refuse the smoke transport unless a smoke call was authoritatively admitted."""
+
+        self.require_runtime_eligible()
+        if self._ledger.smoke_admitted():
+            return BudgetDecision(True, "smoke_admitted")
+        return BudgetDecision(False, "smoke_not_admitted")
+
+    def mark_billing_refused(self, reason: Optional[str] = None) -> None:
+        self._ledger.mark_billing_refused(reason)
+
+    def billing_refused(self) -> bool:
+        return self._ledger.billing_refused()
 
     def begin_turn(self, incident_id: Any) -> BudgetDecision:
         return self._ledger.begin_turn(incident_id)

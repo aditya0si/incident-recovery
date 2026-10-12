@@ -173,9 +173,10 @@ def test_reviewed_scoped_eligibility_enables() -> None:
 
 async def test_reviewed_eligibility_allows_the_transport_call(tmp_path: Path) -> None:
     record: list[httpx.Request] = []
-    adapter, _ = _staging_adapter(
+    adapter, provider_policy = _staging_adapter(
         tmp_path, _ok_handler(record), eligibility=_reviewed_eligibility()
     )
+    provider_policy.admit_smoke()
     step = await adapter.next_step(None)
     assert step is not None
     assert len(record) == 1
@@ -238,7 +239,7 @@ async def test_request_carries_truthful_user_agent_and_stable_session(tmp_path: 
     from incident_recovery.contracts import InvestigationContext
 
     record: list[httpx.Request] = []
-    adapter, _ = _staging_adapter(
+    adapter, provider_policy = _staging_adapter(
         tmp_path, _ok_handler(record), eligibility=_reviewed_eligibility()
     )
     incident_id = uuid4()
@@ -253,6 +254,7 @@ async def test_request_carries_truthful_user_agent_and_stable_session(tmp_path: 
         observations=[],
         adapter_identity="openai-compatible:deepseek-v4.1-flash",
     )
+    provider_policy.admit_investigation(incident_id)
     await adapter.next_step(context)
     await adapter.next_step(context)
     assert len(record) == 2
@@ -273,9 +275,10 @@ async def test_malformed_provider_json_is_a_protocol_error(tmp_path: Path) -> No
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"choices": [{"message": {"content": "not json"}}]})
 
-    adapter, _ = _staging_adapter(
+    adapter, provider_policy = _staging_adapter(
         tmp_path, handler, eligibility=_reviewed_eligibility()
     )
+    provider_policy.admit_smoke()
     with pytest.raises(ModelProtocolError):
         await adapter.next_step(None)
     await adapter.aclose()
@@ -288,9 +291,10 @@ async def test_provider_401_is_unavailable_and_not_retried(tmp_path: Path) -> No
         calls["n"] += 1
         return httpx.Response(401, json={"error": "invalid api key"})
 
-    adapter, _ = _staging_adapter(
+    adapter, provider_policy = _staging_adapter(
         tmp_path, handler, eligibility=_reviewed_eligibility(), max_retries=2
     )
+    provider_policy.admit_smoke()
     with pytest.raises(ModelUnavailable):
         await adapter.next_step(None)
     assert calls["n"] == 1, "authentication failures must not be retried"
@@ -304,9 +308,10 @@ async def test_billing_refusal_stops_without_model_substitution(tmp_path: Path) 
         calls["n"] += 1
         return httpx.Response(402, json={"error": "insufficient credit balance"})
 
-    adapter, _ = _staging_adapter(
+    adapter, provider_policy = _staging_adapter(
         tmp_path, handler, eligibility=_reviewed_eligibility(), max_retries=3
     )
+    provider_policy.admit_smoke()
     with pytest.raises(policy.ProviderBillingRefusal):
         await adapter.next_step(None)
     assert calls["n"] == 1, "billing refusal must stop immediately, never retry"
@@ -318,9 +323,10 @@ async def test_timeout_is_reported_as_unavailable(tmp_path: Path) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("timed out", request=request)
 
-    adapter, _ = _staging_adapter(
+    adapter, provider_policy = _staging_adapter(
         tmp_path, handler, eligibility=_reviewed_eligibility(), max_retries=1
     )
+    provider_policy.admit_smoke()
     with pytest.raises(ModelUnavailable):
         await adapter.next_step(None)
     await adapter.aclose()
@@ -333,6 +339,7 @@ async def test_secret_is_never_exposed_in_errors_or_evidence(tmp_path: Path) -> 
     adapter, provider_policy = _staging_adapter(
         tmp_path, handler, eligibility=_reviewed_eligibility(), max_retries=0
     )
+    provider_policy.admit_smoke()
     with pytest.raises(ModelUnavailable) as excinfo:
         await adapter.next_step(None)
     assert SYNTHETIC_KEY not in str(excinfo.value)
@@ -372,3 +379,124 @@ def test_readiness_doc_records_blocked_live_provider_gate() -> None:
     assert "eligibility remains blocked" in lowered
     # It must record that no live call happened, not imply live compatibility.
     assert "no live provider call was made" in lowered
+
+
+# --- admission is required before every turn/attempt --------------------------
+
+
+def _investigation_context(incident_id):
+    from incident_recovery.contracts import InvestigationContext
+
+    return InvestigationContext(
+        incident_id=incident_id,
+        service_id="demo-api",
+        epoch=1,
+        step=0,
+        tool_calls_used=0,
+        max_tool_calls=12,
+        seconds_remaining=120.0,
+        observations=[],
+        adapter_identity="openai-compatible:deepseek-v4.1-flash",
+    )
+
+
+async def test_unadmitted_smoke_makes_zero_requests_and_zero_attempts(tmp_path: Path) -> None:
+    record: list[httpx.Request] = []
+    adapter, provider_policy = _staging_adapter(
+        tmp_path, _ok_handler(record), eligibility=_reviewed_eligibility()
+    )
+    # Two successive unadmitted calls must both refuse before transport.
+    for _ in range(2):
+        with pytest.raises(policy.ProviderBudgetExceeded):
+            await adapter.next_step(None)
+    assert record == [], "an unadmitted turn must never reach the transport"
+    snapshot = provider_policy.snapshot()
+    assert snapshot["smoke_calls"] == 0
+    assert snapshot["admitted"] == []
+    assert snapshot["attempts"] == {}
+    await adapter.aclose()
+
+
+async def test_unadmitted_investigation_makes_zero_requests(tmp_path: Path) -> None:
+    record: list[httpx.Request] = []
+    adapter, _ = _staging_adapter(
+        tmp_path, _ok_handler(record), eligibility=_reviewed_eligibility()
+    )
+    with pytest.raises(policy.ProviderBudgetExceeded):
+        await adapter.next_step(_investigation_context(uuid4()))
+    assert record == []
+    await adapter.aclose()
+
+
+async def test_one_admitted_smoke_makes_exactly_one_request(tmp_path: Path) -> None:
+    record: list[httpx.Request] = []
+    adapter, provider_policy = _staging_adapter(
+        tmp_path, _ok_handler(record), eligibility=_reviewed_eligibility()
+    )
+    assert provider_policy.admit_smoke().allowed is True
+    await adapter.next_step(None)
+    assert len(record) == 1
+    await adapter.aclose()
+
+
+async def test_revoked_admission_refuses_subsequent_turns(tmp_path: Path) -> None:
+    record: list[httpx.Request] = []
+    adapter, provider_policy = _staging_adapter(
+        tmp_path, _ok_handler(record), eligibility=_reviewed_eligibility()
+    )
+    incident_id = uuid4()
+    assert provider_policy.admit_investigation(incident_id).allowed is True
+    context = _investigation_context(incident_id)
+    await adapter.next_step(context)
+    assert len(record) == 1
+    provider_policy.release_investigation(incident_id)
+    with pytest.raises(policy.ProviderBudgetExceeded):
+        await adapter.next_step(context)
+    assert len(record) == 1, "a revoked/completed admission must not allow transport"
+    await adapter.aclose()
+
+
+async def test_billing_refusal_latches_and_second_call_makes_zero_requests(tmp_path: Path) -> None:
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(402, json={"error": "insufficient credit"})
+
+    adapter, provider_policy = _staging_adapter(
+        tmp_path, handler, eligibility=_reviewed_eligibility()
+    )
+    provider_policy.admit_smoke()
+    with pytest.raises(policy.ProviderBillingRefusal):
+        await adapter.next_step(None)
+    assert calls["n"] == 1
+    with pytest.raises(policy.ProviderBillingRefusal):
+        await adapter.next_step(None)
+    assert calls["n"] == 1, "a latched billing refusal must refuse before transport"
+    assert provider_policy.billing_refused() is True
+    await adapter.aclose()
+
+
+async def test_process_resume_refuses_after_latched_billing(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(402, json={"error": "quota exceeded"})
+
+    adapter, provider_policy = _staging_adapter(
+        tmp_path, handler, eligibility=_reviewed_eligibility()
+    )
+    provider_policy.admit_smoke()
+    with pytest.raises(policy.ProviderBillingRefusal):
+        await adapter.next_step(None)
+    await adapter.aclose()
+
+    # A fresh "process" (new policy/adapter over the same durable path) must
+    # refuse before transport because the billing refusal is latched on disk.
+    resumed_record: list[httpx.Request] = []
+    resumed, _ = _staging_adapter(
+        tmp_path, _ok_handler(resumed_record), eligibility=_reviewed_eligibility()
+    )
+    with pytest.raises(policy.ProviderBillingRefusal):
+        await resumed.next_step(None)
+    assert resumed_record == []
+    await resumed.aclose()
+

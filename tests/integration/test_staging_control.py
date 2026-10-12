@@ -21,7 +21,7 @@ from incident_recovery import db as db_module
 from incident_recovery.contracts import SERVICE_ID as DEMO_SERVICE_ID
 from incident_recovery.contracts import SwitchRequest as DemoSwitchRequest
 from incident_recovery.gateway import DeploymentStore, ensure_deployment_state
-from incident_recovery.models import IncidentState
+from incident_recovery.models import IncidentState, NotFound
 from incident_recovery.repository import IncidentRepository
 from incident_recovery.service_profile import DEMO_PROFILE, STAGING_PROFILE
 from incident_recovery.staging.contracts import (
@@ -157,6 +157,28 @@ async def test_staging_fault_approval_recovery_round_trip(staging_pool) -> None:
     assert recovery.status == "applied"
     assert recovery.snapshot.revision == healthy
     assert recovery.snapshot.predecessor == faulty
+
+
+async def test_reject_binds_the_staging_service_and_refuses_foreign(
+    staging_pool,
+) -> None:
+    repo = IncidentRepository(staging_pool)
+    service = STAGING_PROFILE.service_id
+
+    staging_incident, _ = await repo.ingest_alert("reject-staging", service, "fault", {})
+    await repo.transition(staging_incident.id, IncidentState.INVESTIGATING)
+    await repo.transition(staging_incident.id, IncidentState.AWAITING_APPROVAL)
+    rejected = await repo.reject_incident(staging_incident.id, "operator", service_id=service)
+    assert rejected.state is IncidentState.REJECTED
+
+    # A demo incident (foreign to staging) must not be rejectable under staging.
+    foreign, _ = await repo.ingest_alert("reject-foreign", DEMO_SERVICE_ID, "fault", {})
+    await repo.transition(foreign.id, IncidentState.INVESTIGATING)
+    await repo.transition(foreign.id, IncidentState.AWAITING_APPROVAL)
+    with pytest.raises(NotFound):
+        await repo.reject_incident(foreign.id, "operator", service_id=service)
+    unchanged = await repo.get_incident(foreign.id)
+    assert unchanged is not None and unchanged.state is IncidentState.AWAITING_APPROVAL
 
 
 async def test_demo_switch_cannot_route_a_staging_reservation(staging_pool) -> None:

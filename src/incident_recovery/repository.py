@@ -874,23 +874,35 @@ class IncidentRepository:
         reason: Optional[str] = None,
         proposal_digest: Optional[str] = None,
         now: Optional[datetime] = None,
+        service_id: str = SERVICE_ID,
     ) -> Incident:
+        """Reject an awaiting-approval incident bound to ``service_id``.
+
+        The service binding is enforced in the same conditional ``UPDATE`` as the
+        state: an incident belonging to another service (or any other service
+        profile) can never be rejected here, so a foreign incident is left
+        completely unchanged.
+        """
+
         instant = ensure_utc(now or utcnow())
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
                     f"UPDATE incidents SET state = $2, updated_at = now(), "
                     f"version = version + 1 "
-                    f"WHERE id = $1 AND state = $3 RETURNING {_COLS_Q}",
+                    f"WHERE id = $1 AND state = $3 AND service_id = $4 RETURNING {_COLS_Q}",
                     incident_id,
                     IncidentState.REJECTED.value,
                     IncidentState.AWAITING_APPROVAL.value,
+                    service_id,
                 )
                 if row is None:
                     current = await conn.fetchrow(
-                        "SELECT state FROM incidents WHERE id = $1", incident_id
+                        "SELECT state, service_id FROM incidents WHERE id = $1", incident_id
                     )
-                    if current is None:
+                    if current is None or current["service_id"] != service_id:
+                        # Unknown to this service: never disclose or mutate a
+                        # foreign incident.
                         raise NotFound(f"incident {incident_id} not found")
                     raise IllegalStateTransition(
                         f"cannot reject incident in state {current['state']}"
