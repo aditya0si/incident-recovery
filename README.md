@@ -351,9 +351,10 @@ uv run python scripts/verify.py --live          # additionally run the optional 
   in [docs/evidence.md](docs/evidence.md).
 
 The last full run (`--docker --ui`) recorded **19 checks passed, 0 failed,
-0 blocked**, covering **154 executed test cases** (101 backend, 31 frontend, and
-22 real Docker/browser E2E). Counts are generated from the actual report; see
-`docs/evidence.md` for the exact commands and results.
+0 blocked**, covering **229 executed test cases** (176 backend — 98 unit + 78
+integration — 31 frontend, and 22 real Docker/browser E2E). Counts are generated
+from the actual report; see `docs/evidence.md` for the exact commands and
+results.
 
 ### Optional live-model check
 
@@ -363,6 +364,40 @@ credential). When they are absent the check is reported as **blocked**
 (`live_model_unconfigured`), never as a success. When configured it performs a
 real provider call and asserts the recorded investigation adapter is
 `openai-compatible:*`.
+
+## Staging readiness verification (isolated staging track)
+
+The isolated `tenant-api-platform` staging work (Tasks 1–4) has its own serial,
+reproducible driver: **`scripts/staging_verify.py`**. It runs the real gates one
+after another and writes a machine-readable report plus sanitized durable logs to
+`.hermes/evidence/staging-task5/`.
+
+```bash
+# full serial verification (builds the real staging + demo stacks, runs the
+# browser E2E, then restores both stacks healthy)
+uv run python scripts/staging_verify.py
+
+# reuse already-built images / skip the demo regression while iterating
+uv run python scripts/staging_verify.py --skip-build --skip-demo
+```
+
+It keeps the two readiness gates **separate**:
+
+- `staging_integration` — pinned source/fault materialization, the Docker-free
+  staging suite (one opt-in E2E skip is counted separately and then explicitly
+  run via `STAGING_E2E=1`), the real authenticated baseline (25/25), the real
+  injected-fault approved recovery + dependency-outage refusal (20/20), and the
+  real 12-case scripted evaluation (12/12). All passed.
+- `live_readiness` — **blocked**. The live batch is intentionally always blocked
+  with 12 blocked cases, 0 executed, 0 provider transport attempts, and live
+  safety reported as *not established* (`safety_ok: null`), never a vacuous
+  `true`. This documents the current no-live-execution implementation, not a
+  credential-configuration gap.
+- `demo_regression` — the full `scripts/verify.py --docker --ui` run.
+
+Scope limits and provenance are in `docs/staging-readiness.md` and
+`docs/staging-evidence.md`. This is **not** a production-readiness claim:
+staging integration is verified while live-readiness remains blocked.
 
 ## Operator API demonstration
 

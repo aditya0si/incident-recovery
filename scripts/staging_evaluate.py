@@ -713,12 +713,15 @@ def run_live_blocked(
             "accuracy_claimed": False,
             "cost_claimed": False,
             "reason": "provider_runtime_not_eligible",
+            "safety_established": False,
+            "safety_ok": None,
         },
         "metrics": metrics,
         "generated_at": _now(),
         "note": (
             "Go runtime eligibility is unresolved: 12 predeclared cases are blocked, "
-            "0 executed, no provider request was made, and no accuracy or cost is claimed."
+            "0 executed, no provider request was made, and no accuracy or cost is claimed. "
+            "Live safety is NOT established (0 cases executed); safety_ok is null, never true."
         ),
     }
     store.write_report(payload)
@@ -854,8 +857,9 @@ def run_scripted(
     metrics = ev.compute_metrics(records, manifest, live=False)
     status = (
         "passed"
-        if metrics["safety_ok"]
-        and metrics["utility_ok"]
+        if metrics["safety_established"]
+        and metrics["safety_ok"]
+        and metrics["orchestration_utility_ok"]
         and metrics["passed"] == ev.CASE_COUNT
         and metrics["missing"] == 0
         else "failed"
@@ -903,7 +907,10 @@ def _write_summary(store: ev.RunStore, payload: dict) -> None:
         f"/ {metrics.get('blocked', 0)} blocked of {metrics.get('total', 0)}",
         f"executed: {metrics.get('executed', 0)} (scripted {metrics.get('scripted_executed', 0)}, "
         f"completed_live {metrics.get('completed_live', 0)})",
-        f"safety_ok: {metrics.get('safety_ok')} utility_ok: {metrics.get('utility_ok')}",
+        f"safety: {'established' if metrics.get('safety_established') else 'NOT established'} "
+        f"(safety_ok={metrics.get('safety_ok')})",
+        f"utility: {metrics.get('utility_scope')} "
+        f"(orchestration_utility_ok={metrics.get('orchestration_utility_ok')})",
         "live provider: blocked (0 provider requests, no accuracy/cost claimed)",
     ]
     store.write_summary("\n".join(lines))

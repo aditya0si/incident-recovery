@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import secrets
 import subprocess
 import sys
@@ -48,6 +49,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 STAGING = REPO_ROOT / "staging"
 COMPOSE_FILE = STAGING / "compose.yaml"
 ENV_FILE = STAGING / ".env"
+CONTROL_ENV_FILE = STAGING / ".control.env"
 PROJECT = "incident-recovery-staging"
 DEFAULT_EVIDENCE = REPO_ROOT / ".hermes" / "evidence" / "staging-task1"
 DEMO_PROJECT = "incident-recovery"
@@ -130,17 +132,33 @@ def run(
 
 
 def compose_argv(*args: str) -> list[str]:
-    return [
-        "docker",
-        "compose",
-        "-f",
-        str(COMPOSE_FILE),
-        "--env-file",
-        str(ENV_FILE),
-        "-p",
-        PROJECT,
-        *args,
-    ]
+    # The isolated control-plane services live in the same Compose file under the
+    # `recovery` profile.  Compose interpolates their variables even when the
+    # profile is inactive, so supplying the gitignored control env (when present)
+    # keeps the default baseline stack warning-free; the profile still does not
+    # start them.  This does not change the Task 1 default stack.
+    argv = ["docker", "compose", "-f", str(COMPOSE_FILE), "--env-file", str(ENV_FILE)]
+    if CONTROL_ENV_FILE.exists():
+        argv += ["--env-file", str(CONTROL_ENV_FILE)]
+    return [*argv, "-p", PROJECT, *args]
+
+
+_CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{12,64}$")
+
+
+def _container_id(text: str) -> str:
+    """Extract a container id from command output, ignoring Compose warnings.
+
+    Compose writes interpolation warnings to stderr; the baseline merges stderr
+    into stdout, so a naive ``strip()`` could yield warning text instead of the
+    id.  Only a line that is exactly a hex container id is accepted.
+    """
+
+    for line in reversed(text.splitlines()):
+        candidate = line.strip()
+        if _CONTAINER_ID_RE.match(candidate):
+            return candidate
+    return ""
 
 
 def http_request(
@@ -244,7 +262,7 @@ def _inspect_resources(values: dict, sanitizer: Sanitizer) -> dict:
     net = run(["docker", "network", "ls", "--filter", f"name={PROJECT}", "--format", "{{.Name}}"], timeout=30)
     info["networks"] = [line for line in net.stdout.splitlines() if line.strip()]
 
-    api_id = run(compose_argv("ps", "-q", "api"), timeout=30, sanitizer=sanitizer).stdout.strip()
+    api_id = _container_id(run(compose_argv("ps", "-q", "api"), timeout=30, sanitizer=sanitizer).stdout)
     if api_id:
         label = run(
             [

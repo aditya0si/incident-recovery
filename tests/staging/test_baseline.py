@@ -83,11 +83,34 @@ def test_gateway_port_preference_is_probed() -> None:
     assert 18090 <= chosen <= 65535
 
 
+def test_container_id_extraction_ignores_compose_warnings() -> None:
+    container_id = "eacbf87d779a1e0702d6cc7924677abe323a7b889d55bd852a5b36060c05c809"
+    noisy = (
+        'time="2026-10-12T05:02:00+05:30" level=warning '
+        'msg="The \\"STAGING_CONTROL_DB_USER\\" variable is not set. Defaulting to a blank string."\n'
+        f"{container_id}\n"
+    )
+    assert staging_baseline._container_id(noisy) == container_id
+    assert staging_baseline._container_id("warning only\n") == ""
+
+
+def test_compose_argv_supplies_the_control_env_when_present() -> None:
+    argv = staging_baseline.compose_argv("config", "-q")
+    assert "--env-file" in argv
+    assert str(staging_baseline.ENV_FILE) in argv
+    # The recovery-profile services interpolate STAGING_CONTROL_* variables, so the
+    # control env must be supplied (when present) to keep the default stack quiet.
+    if staging_baseline.CONTROL_ENV_FILE.exists():
+        assert str(staging_baseline.CONTROL_ENV_FILE) in argv
+
+
 def test_real_staging_baseline(tmp_path: Path) -> None:
     if os.environ.get("STAGING_E2E") != "1":
         pytest.skip("set STAGING_E2E=1 to run the real Docker staging baseline")
-    report_path = tmp_path / "staging-baseline.json"
-    report = staging_baseline.run_baseline(report_path=report_path)
+    evidence_dir = Path(os.environ.get("STAGING_EVIDENCE_DIR") or tmp_path)
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    report_path = evidence_dir / "staging-baseline.json"
+    report = staging_baseline.run_baseline(report_path=report_path, evidence_dir=evidence_dir)
     assert report_path.exists()
     payload = json.loads(report_path.read_text(encoding="utf-8"))
     assert payload["status"] == "passed", json.dumps(payload.get("failed_checks", []))

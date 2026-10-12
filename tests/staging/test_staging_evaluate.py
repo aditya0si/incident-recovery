@@ -88,3 +88,30 @@ def test_manifest_mutation_is_refused_after_a_run_begins(tmp_path: Path) -> None
         pass
     else:  # pragma: no cover - the refusal is the point of the test
         raise AssertionError("a mutated manifest must be refused")
+
+
+def test_live_payload_marks_safety_not_established(tmp_path: Path) -> None:
+    manifest = _manifest()
+    store = ev.RunStore(tmp_path / "runs", "live-safety")
+    payload = script.run_live_blocked(manifest, store, run_id="live-safety")
+    assert payload["live"]["safety_ok"] is None
+    assert payload["live"]["safety_established"] is False
+    metrics = payload["metrics"]
+    assert metrics["safety_ok"] is None
+    assert metrics["safety_established"] is False
+    assert metrics["scripted_executed"] == 0
+    assert metrics["executed"] == 0
+    summary = (store.run_dir / "summary.log").read_text(encoding="utf-8")
+    assert "NOT established" in summary
+
+
+def test_manifest_versions_derive_source_sha_from_the_pinned_manifest() -> None:
+    import staging_source
+
+    manifest = _manifest()
+    versions = script._manifest_versions(manifest)
+    pinned = staging_source.load_manifest(staging_source.DEFAULT_MANIFEST)
+    assert versions.source_sha == pinned["source_sha"]
+    assert versions.source_sha != ""
+    assert versions.image.endswith(pinned["source_sha"][:7])
+

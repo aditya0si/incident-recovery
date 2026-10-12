@@ -154,3 +154,36 @@ def test_stale_deployment_evidence_is_refused() -> None:
     )
     assert decision.allowed is False
     assert decision.reason == "stale_deployment_evidence"
+
+
+def test_dependency_outage_with_stale_generation_never_admits_a_rollback() -> None:
+    """A dependency outage must win over any deployment-generation race.
+
+    Even when the deployment observation is stale/contradictory, a real
+    dependency failure is non-repairable by a rollback: the gate refuses with the
+    dependency reason and never falls through to an executable rollback.
+    """
+
+    incident_id = uuid4()
+    health = _evidence(
+        incident_id,
+        kind=EvidenceType.HEALTH,
+        payload={"functional_ok": False, "http_status": 500, "dependencies_ok": False},
+    )
+    stale = _evidence(
+        incident_id,
+        kind=EvidenceType.DEPLOYMENT,
+        payload={"current_revision": HEALTHY, "generation": 1},
+    )
+    decision = evaluate_diagnosis(
+        _diagnosis([health.id, stale.id]),
+        incident_id=incident_id,
+        epoch=1,
+        evidence=[health, stale],
+        snapshot=_snapshot(),
+        known_good_revision=HEALTHY,
+        broken_revision=FAULTY,
+    )
+    assert decision.allowed is False
+    assert decision.reason == "dependencies_unhealthy"
+    assert getattr(decision, "target_revision", None) is None

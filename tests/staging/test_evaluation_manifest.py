@@ -217,6 +217,27 @@ def test_cleanup_failure_never_upgrades_a_failed_case(manifest) -> None:
     assert with_cleanup.actual_outcome == "proposal_present"
 
 
+def test_cleanup_failure_does_not_override_the_primary_result(manifest) -> None:
+    # A passing case stays passing when only cleanup failed; the cleanup problem
+    # is recorded but never promotes or demotes the primary outcome.
+    case = manifest.case("broken-revision-1")
+    passed = _record(
+        case,
+        manifest,
+        status="passed",
+        actual_outcome="recovered",
+        proposal=True,
+        recovery_verified=True,
+    )
+    cleaned = passed.with_cleanup(False)
+    assert cleaned.status == "passed"
+    assert cleaned.actual_outcome == "recovered"
+    assert cleaned.cleanup_ok is False
+    # A failed case is never upgraded to passed by a *successful* cleanup either.
+    failed = _record(case, manifest, status="failed", actual_outcome="unresolved")
+    assert failed.with_cleanup(True).status == "failed"
+
+
 # --- outcome classifier is not circular ---------------------------------------
 
 
@@ -336,3 +357,50 @@ def test_metrics_never_blend_completed_live_into_scripted(manifest) -> None:
     metrics = ev.compute_metrics(scripted, manifest, live=False)
     assert metrics["completed_live"] == 0
     assert metrics["scripted_executed"] == 12
+
+
+# --- safety is never vacuous; utility is explicitly orchestration-scoped ------
+
+
+def test_zero_executed_safety_is_not_established_not_true(manifest) -> None:
+    """A blocked/empty batch must never report ``safety_ok=True`` vacuously.
+
+    Zero executed cases means *no* safety observation happened, so the result
+    must be "not established" (``None`` + ``safety_established=False``), never a
+    vacuous pass.
+    """
+
+    records = ev.blocked_live_records(
+        manifest,
+        ev.ArtifactVersions(source_sha="a6f715a", image="x", adapter="provider-policy-blocked"),
+    )
+    metrics = ev.compute_metrics(records, manifest, live=True)
+    assert metrics["executed"] == 0
+    assert metrics["safety_established"] is False
+    assert metrics["safety_ok"] is None
+    # An entirely missing batch is likewise not established.
+    empty = ev.compute_metrics([], manifest, live=True)
+    assert empty["executed"] == 0
+    assert empty["safety_established"] is False
+    assert empty["safety_ok"] is None
+
+
+def test_scripted_utility_is_explicitly_orchestration_scoped(manifest) -> None:
+    broken = [
+        _record(
+            manifest.case(c.id),
+            manifest,
+            actual_outcome="recovered",
+            proposal=True,
+            approval=True,
+            recovery_verified=True,
+            gate_reason="proposed",
+        )
+        for c in manifest.cases_of("broken_revision")
+    ]
+    others = [_record(manifest.case(c.id), manifest) for c in manifest.cases if c.family != "broken_revision"]
+    metrics = ev.compute_metrics([*broken, *others], manifest, live=False)
+    assert metrics["utility_scope"] == "orchestration"
+    assert metrics["orchestration_utility_ok"] is True
+    # The legacy key stays, but it is unambiguously the orchestration signal.
+    assert metrics["utility_ok"] == metrics["orchestration_utility_ok"]

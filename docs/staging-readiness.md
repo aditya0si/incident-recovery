@@ -146,11 +146,48 @@ separate control database, so the default `up` (and this document) remain the
 Task 1 baseline. Runtime provider eligibility is still **blocked**: Task 3 runs
 through the labelled `scripted:tenant-api-staging` adapter, not a live model.
 
+## Task 5: serial reproducible staging verification
+
+`scripts/staging_verify.py` is the Task 5 independent verification driver. It
+runs every staging gate **serially** (never two mutating steps at once), then the
+full `scripts/verify.py --docker --ui` demo regression, and restores both stacks
+healthy in a `finally` block. It writes a machine-readable report and sanitized
+logs to `.hermes/evidence/staging-task5/`.
+
+```bash
+uv run python scripts/staging_verify.py          # full serial run
+uv run python scripts/staging_verify.py --skip-build --skip-demo
+```
+
+Reported status (actual, from the executed run):
+
+| Gate | Status | Evidence |
+| --- | --- | --- |
+| `staging_integration` | passed | source/fault materialization; Docker-free staging suite 163 passed (+1 opt-in skip run separately via `STAGING_E2E=1`); real baseline 25/25; real recovery 20/20; scripted evaluation 12/12 |
+| `demo_regression` | passed | `scripts/verify.py --docker --ui`: 19 checks passed / 0 failed / 0 blocked; 229 executed test cases |
+| `live_readiness` | **blocked** | 12 blocked cases, 0 executed, 0 provider requests, `safety_ok: null` (not established) |
+| `provider_blocked` | **blocked** | `go_runtime_eligible(default_go_runtime_eligibility())` is `False` |
+
+The two readiness gates are deliberately separate: **staging integration is
+verified while live-readiness remains blocked.** This is not a production
+readiness claim.
+
+Loopback ports (probed, all `127.0.0.1`): staging gateway `18090`, worker metrics
+`18091`, API `18092`, console `18093`, control PostgreSQL `18094`, control API
+`18095`, workload PostgreSQL `18096`, workload Redis `18097`. The demo uses
+`18080`/`18081` (test override)/`18082`/`18083`/`15432` and is unchanged.
+
+The driver's report records the actual `source.sha`, `source.dirty`, every
+command and exit code, the pinned source/archive/fault-patch hashes, the
+manifest hash, the adapter identity, and the scripted/live case counts. The live
+case artifacts are checked to have `tokens: null` / `cost: null` (unknown usage
+is never recorded as `0`) and `provider_transport_attempted: false`.
+
 ## Remaining blockers / out of scope
 
-- Live paid provider eligibility and bounded live investigation (Task 2).
-- Predeclared 12-case evaluation: implemented in Task 4 and recorded in
-  `docs/staging-evidence.md` (scripted 12/12 passed, live blocked with 0 calls).
-- Independent full-verification review (Task 5).
+- Live paid provider eligibility and bounded live investigation (Task 2) —
+  **still blocked**; the live-readiness gate stays blocked with 0 executed cases.
+- Independent fresh adversarial review of the Task 5 verification (performed by
+  the parent only after the writer exits; this document does not replace it).
 - The staging gateway/console are implemented for Task 3 under the `recovery`
-  profile; live paid evaluation and the full demo regression belong to Task 5.
+  profile; the default `up` remains the Task 1 baseline.

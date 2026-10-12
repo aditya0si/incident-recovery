@@ -6,9 +6,14 @@ counts: every number below is copied from the machine-readable report produced b
 the verification driver at `.hermes/evidence/verify/report.json` (logs alongside
 it under `.hermes/evidence/verify/logs/`).
 
-- **Source revision:** `436587b6654eb0bb115c8c2a7b33020245d5b95a`
-  (`feat/incident-recovery`, clean working tree at run time)
-- **Report generated:** `2026-10-11T18:56:16Z` → `2026-10-11T19:04:22Z` (UTC)
+- **Source revision:** `ffee66b727bd2ba346d0a777710f58adc8fa1f50`
+  (`feat/incident-recovery`) **plus the uncommitted staging Task 5 working tree**;
+  the report records `dirty: true` because the run happened before the Task 5
+  commit. The committed Task 5 revision is the commit that adds
+  `scripts/staging_verify.py`.
+- **Report generated:** `2026-10-11T23:52:07Z` → `2026-10-12T00:13:44Z` (UTC).
+  This run was executed as the `demo_regression` gate of the staging Task 5
+  driver (`scripts/staging_verify.py`), not standalone.
 - **Host:** Windows, Python 3.14.5, Docker Engine 29.6.2, Compose v5.3.1,
   Node v26.7.0, npm 11.19.0
 
@@ -32,7 +37,7 @@ against the values in `.env`, and Compose configuration is validated only with
 
 | Check | Command | Result | Counts |
 | --- | --- | --- | --- |
-| backend_unit | `uv run pytest tests/unit -q` | passed | 69 passed |
+| backend_unit | `uv run pytest tests/unit -q` | passed | 98 passed |
 | frontend_install | `npm --prefix frontend ci` | passed | — |
 | frontend_unit | `npm --prefix frontend test -- --run` | passed | 31 passed |
 | frontend_build | `npm --prefix frontend run build` | passed | — |
@@ -40,7 +45,7 @@ against the values in `.env`, and Compose configuration is validated only with
 | compose_config_default | `docker compose -p incident-recovery -f compose.yaml config -q` | passed | — |
 | compose_config_overrides | `docker compose -p incident-recovery -f compose.yaml -f compose.test.yaml -f compose.investigation.yaml config -q` | passed | — |
 | compose_up_default | `docker compose -p incident-recovery -f compose.yaml up --build -d --wait` | passed | — |
-| backend_integration | `uv run pytest tests/integration -q` | passed | 69 passed |
+| backend_integration | `uv run pytest tests/integration -q` | passed | 78 passed |
 | compose_up_overrides | override `up --build -d --wait` | passed | — |
 | e2e_deployment | `uv run pytest tests/e2e/test_deployment.py -q` | passed | 4 passed |
 | e2e_recovery | `uv run pytest tests/e2e/test_recovery.py -q` | passed | 3 passed |
@@ -48,11 +53,12 @@ against the values in `.env`, and Compose configuration is validated only with
 | e2e_resilience | `uv run pytest tests/e2e/test_resilience.py -q` | passed | 9 passed |
 | e2e_console | `uv run pytest tests/e2e/test_console.py -q` | passed | 5 passed (real Chromium) |
 | compose_restore_default | default `up --build -d --wait` | passed | — |
-| tracked_secret_scan | `git ls-files` + pattern scan | passed | 85 tracked files, no secret material |
+| tracked_secret_scan | `git ls-files` + pattern scan | passed | 128 tracked files, no secret material |
 
 Totals from the report: **19 checks passed, 0 failed, 0 blocked; required checks
-OK.** That corresponds to 191 executed test cases
-(138 backend, 31 frontend, 22 real Docker/browser E2E).
+OK.** That corresponds to 229 executed test cases
+(176 backend — 98 unit + 78 integration — 31 frontend, and 22 real
+Docker/browser E2E).
 
 ## Adversarial repair
 
