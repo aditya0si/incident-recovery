@@ -40,7 +40,6 @@ from incident_recovery.models import (
     LeaseLost,
     ModelProtocolError,
     ModelUnavailable,
-    RUN_ESCALATED,
     RUN_RUNNING,
 )
 from incident_recovery.tools import ToolRunner, redact_secrets
@@ -602,7 +601,8 @@ def _incident():
 
 
 async def test_agent_enforces_tool_call_budget_and_escalates() -> None:
-    clock = lambda: NOW
+    def clock():
+        return NOW
     repo = FakeRepo(_snapshot(), clock)
     tools = FakeTools()
     agent = InvestigationAgent(

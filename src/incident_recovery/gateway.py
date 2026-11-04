@@ -24,7 +24,7 @@ from typing import Optional
 import asyncpg
 import httpx
 import uvicorn
-from fastapi import FastAPI, Header, Request
+from fastapi import FastAPI, Header
 from fastapi.responses import JSONResponse, Response
 
 from .contracts import (

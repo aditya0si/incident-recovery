@@ -17,7 +17,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
-import pytest
 
 from incident_recovery.verification import (
     FunctionalCheck,

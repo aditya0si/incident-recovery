@@ -113,7 +113,6 @@ async def test_proxy_refuses_an_unknown_revision() -> None:
 
 
 def test_evaluate_switch_refuses_a_revision_outside_the_profile_set() -> None:
-    from incident_recovery.contracts import OperationRecord
 
     current = DeploymentSnapshot(
         service_id=STAGING_PROFILE.service_id,

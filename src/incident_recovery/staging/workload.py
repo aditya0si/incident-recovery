@@ -15,7 +15,7 @@ so an action parameter can never come from the model or a request body.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Awaitable, Callable, Optional
+from typing import Awaitable, Callable, Optional
 from uuid import UUID
 
 from ..contracts import ToolObservation, ToolRequest
@@ -23,7 +23,6 @@ from ..models import (
     Evidence,
     EvidenceType,
     InvestigationBudgetExhausted,
-    ModelProtocolError,
     Operation,
     utcnow,
 )

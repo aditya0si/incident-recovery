@@ -1,0 +1,97 @@
+# Verification gate.
+#
+# The repo shipped without CI: 98 unit tests, 82 Postgres-backed integration tests and a Docker
+# rehearsal harness existed, but nothing ran them on push. This splits them by what they need so a
+# failure names the layer:
+#
+#   lint         ruff, no services
+#   unit         tests/unit, no services
+#   integration  tests/integration against a real Postgres service container
+#
+# `tests/integration/test_live_api.py` needs the full compose stack (it injects faults through the
+# running API and restarts it), so it is excluded here rather than left to fail: a gate that is red
+# for a reason unrelated to the change is a gate people learn to ignore. It runs in the compose e2e
+# path documented in compose.test.yaml.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      - name: ruff
+        run: uv run --frozen ruff check . --output-format=concise
+
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      - name: unit tests
+        run: uv run --frozen pytest tests/unit -q -p no:cacheprovider --durations=10
+
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: incident
+          POSTGRES_PASSWORD: incident
+          POSTGRES_DB: incident_recovery
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U incident -d incident_recovery"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      # conftest.py loads a local .env when present; these override it in CI so the fixtures
+      # talk to the service container instead of a developer's compose stack.
+      POSTGRES_USER: incident
+      POSTGRES_PASSWORD: incident
+      POSTGRES_DB: incident_recovery
+      POSTGRES_PORT: "5432"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      - name: wait for postgres
+        run: |
+          for i in $(seq 1 30); do
+            if pg_isready -h 127.0.0.1 -p 5432 -U incident -d incident_recovery 2>/dev/null; then
+              echo "postgres ready after $i attempts"; exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::postgres never became ready"; exit 1
+      - name: integration tests
+        run: >
+          uv run --frozen pytest tests/integration -q -p no:cacheprovider --durations=10
+          --ignore=tests/integration/test_live_api.py

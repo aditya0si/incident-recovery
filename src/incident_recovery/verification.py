@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Awaitable, Callable, Optional, Protocol, Sequence
+from typing import Awaitable, Callable, Optional, Protocol
 
 import httpx
 

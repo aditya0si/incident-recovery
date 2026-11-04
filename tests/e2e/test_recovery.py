@@ -25,7 +25,6 @@ import pytest_asyncio
 from incident_recovery import db as db_module
 from incident_recovery.contracts import SwitchRequest
 from incident_recovery.gateway import DeploymentStore
-from incident_recovery.models import IncidentState
 from incident_recovery.repository import IncidentRepository
 
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://127.0.0.1:18080")

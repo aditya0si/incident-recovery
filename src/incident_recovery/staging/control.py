@@ -20,10 +20,9 @@ from __future__ import annotations
 import asyncio
 import hmac
 import os
-from typing import Optional, Protocol
+from typing import Optional
 from uuid import UUID, uuid4
 
-import httpx
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -312,8 +311,7 @@ def build_staging_worker(repo, pool, env: dict):
     """Construct the evaluated staging recovery worker (investigation + recovery)."""
 
     from ..agent import InvestigationAgent
-    from ..executor import RecoveryExecutor
-    from ..verification import DEFAULT_INTERVAL_SECONDS, DEFAULT_REQUIRED_STREAK, RecoveryVerifier
+    from ..verification import RecoveryVerifier
     from ..worker import RecoveryWorker
     from .observations import StagingDependencyProbe, StagingFunctionalProbe, StagingObserver
     from .workload import StagingScriptedAdapter, StagingToolRunner
@@ -354,7 +352,6 @@ def build_staging_worker(repo, pool, env: dict):
         env.get("EXECUTOR_URL", "http://staging-executor:8000"),
         env.get("INTERNAL_TOKEN", ""),
     )
-    store = DeploymentStore(pool, profile=profile)
     worker = RecoveryWorker(
         repo,
         executor,

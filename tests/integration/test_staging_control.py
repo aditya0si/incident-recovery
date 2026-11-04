@@ -67,8 +67,10 @@ async def test_staging_rows_do_not_collide_with_demo(staging_pool) -> None:
     demo = DeploymentStore(staging_pool, profile=DEMO_PROFILE)
     staging_snapshot = await staging.get_snapshot()
     assert staging_snapshot.revision == STAGING_HEALTHY_REVISION
-    # A demo store over the same schema only ever sees its own seeded row and
-    # refuses to operate on the absent demo row rather than reading staging.
+    # A demo store over the same schema never reads the staging row: with no demo
+    # row present it refuses, rather than silently serving staging state.
+    with pytest.raises(RuntimeError, match="not initialised"):
+        await demo.get_snapshot()
     rows = await staging_pool.fetch(
         "SELECT service_id FROM deployment_state ORDER BY service_id"
     )
