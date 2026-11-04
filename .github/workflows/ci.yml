@@ -14,9 +14,11 @@
 # path documented in compose.test.yaml.
 name: ci
 
+# No branch filter: this repo's default branch is `feat/incident-recovery`, and a
+# `branches: [main]` filter silently matched nothing (the workflow existed, the
+# push landed, zero runs were created). Any push runs the gate.
 on:
   push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
 
