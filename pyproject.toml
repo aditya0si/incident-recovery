@@ -17,6 +17,9 @@ dev = [
     "playwright>=1.63.0",
     "pytest>=8.0,<9.0",
     "pytest-asyncio>=0.23,<1.0",
+    # The linter is a project dependency, not something CI hopes is on PATH:
+    # `uv run ruff` failed to spawn until it was declared here.
+    "ruff>=0.15,<1.0",
 ]
 
 [build-system]
@@ -30,3 +33,14 @@ packages = ["src/incident_recovery"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = "-ra"
+
+# Pin the rule set, not just the version. Ruff's default selection has widened
+# across releases (0.15 -> 0.17 added UP, ASYNC, RUF, SIM, C4, ISC to the
+# defaults), so an unconfigured gate means "whatever this month's ruff thinks" and
+# a dependency bump turns CI red for code nobody touched. E4/E7/E9/F is the
+# historical default: real errors only. Widening it is a deliberate commit.
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
